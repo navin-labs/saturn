@@ -1,0 +1,18 @@
+{
+  "source_of_truth": "docs/SATURN_CANONICAL_SPEC.md",
+  "allow_commands": [
+    "python3 -m py_compile",
+    "bash scripts/",
+    "systemctl --user",
+    "git status",
+    "git diff"
+  ],
+  "deny_patterns": [
+    ".env",
+    "telegram.env",
+    "secrets/",
+    "rm -rf /",
+    "curl http",
+    "curl https"
+  ]
+}
