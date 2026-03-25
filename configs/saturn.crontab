@@ -1,0 +1,5 @@
+0 8 * * * /home/navin/Workspace/Saturn/scripts/saturn-morning.sh >> /home/navin/Workspace/Saturn/logs/morning.log 2>&1
+0 * * * * /home/navin/Workspace/Saturn/scripts/saturn-hourly.sh >> /home/navin/Workspace/Saturn/logs/hourly.log 2>&1
+0 18 * * * /home/navin/Workspace/Saturn/scripts/saturn-progress-review.sh >> /home/navin/Workspace/Saturn/logs/progress.log 2>&1
+0 22 * * * /home/navin/Workspace/Saturn/scripts/saturn-report.sh >> /home/navin/Workspace/Saturn/logs/report.log 2>&1
+*/5 * * * * /home/navin/mcp-env/bin/python /home/navin/Workspace/Saturn/backend/tools/email_reader.py >> /home/navin/Workspace/Saturn/logs/email_reader.log 2>&1

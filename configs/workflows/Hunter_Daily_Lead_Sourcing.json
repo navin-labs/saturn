@@ -1,0 +1,158 @@
+{
+  "name": "Hunter Daily Lead Sourcing",
+  "nodes": [
+    {
+      "id": "1",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "2",
+      "name": "SerpAPI Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        200,
+        0
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://serpapi.com/search.json",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{$env.SERPAPI_QUERY}}"
+            },
+            {
+              "name": "api_key",
+              "value": "={{$env.SERPAPI_KEY}}"
+            },
+            {
+              "name": "num",
+              "value": "10"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "3",
+      "name": "Extract Leads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const results = $input.first().json.organic_results || [];\nreturn results.slice(0,10).map(r => ({\n  json: {\n    title: r.title || '',\n    link: r.link || '',\n    snippet: r.snippet || '',\n    domain: (r.link||'').replace(/https?:\\/\\/(www\\.)?/,'').split('/')[0]\n  }\n}));"
+      }
+    },
+    {
+      "id": "4",
+      "name": "Add Lead to SATURN",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        600,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8787/api/tools/call",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"tool\": \"add_lead\",\n  \"args\": {\n    \"name\": \"={{$json.title}}\",\n    \"company\": \"={{$json.domain}}\",\n    \"source\": \"serpapi_n8n\",\n    \"notes\": \"={{$json.snippet}}\",\n    \"website\": \"={{$json.link}}\"\n  }\n}",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "5",
+      "name": "Log Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconsole.log(`Hunter workflow: processed ${items.length} leads`);\nreturn [{json: {processed: items.length, timestamp: new Date().toISOString()}}];"
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "SerpAPI Search",
+            "type": "main",
+            "index": 0,
+            "nodeId": "2"
+          }
+        ]
+      ]
+    },
+    "SerpAPI Search": {
+      "main": [
+        [
+          {
+            "node": "Extract Leads",
+            "type": "main",
+            "index": 0,
+            "nodeId": "3"
+          }
+        ]
+      ]
+    },
+    "Extract Leads": {
+      "main": [
+        [
+          {
+            "node": "Add Lead to SATURN",
+            "type": "main",
+            "index": 0,
+            "nodeId": "4"
+          }
+        ]
+      ]
+    },
+    "Add Lead to SATURN": {
+      "main": [
+        [
+          {
+            "node": "Log Result",
+            "type": "main",
+            "index": 0,
+            "nodeId": "5"
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {}
+}

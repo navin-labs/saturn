@@ -1,0 +1,26 @@
+"""Import shim for backend/saturn-api.py.
+
+This preserves the existing script entrypoint while exposing an importable
+module path for validation and tests.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+
+_SOURCE = Path(__file__).with_name("saturn-api.py")
+_SPEC = importlib.util.spec_from_file_location("backend.saturn_api_runtime", _SOURCE)
+if _SPEC is None or _SPEC.loader is None:
+    raise ImportError(f"Unable to load {_SOURCE}")
+
+_MODULE = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_MODULE)
+
+for _name in dir(_MODULE):
+    if _name.startswith("__") and _name not in {"__all__", "__doc__"}:
+        continue
+    globals()[_name] = getattr(_MODULE, _name)
+
+__all__ = getattr(_MODULE, "__all__", [name for name in globals() if not name.startswith("_")])

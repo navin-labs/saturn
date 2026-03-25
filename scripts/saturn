@@ -1,0 +1,12 @@
+#!/bin/bash
+# This is the main wrapper script for the SATURN MCP server.
+# It ensures the MCP server is called with the correct Python environment.
+
+# Path to the MCP Python virtual environment's Python interpreter
+PYTHON_BIN="/home/navin/mcp-env/bin/python3"
+
+# Path to the deployed MCP server script
+MCP_SERVER_SCRIPT="/home/openclaw-user/workspace/saturn-mcp/server.py"
+
+# Execute the MCP server with the provided arguments
+exec "$PYTHON_BIN" "$MCP_SERVER_SCRIPT" "$@"
