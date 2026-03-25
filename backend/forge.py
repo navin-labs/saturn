@@ -12,7 +12,8 @@ import httpx
 DB_PATH = Path('/home/navin/Workspace/Saturn/database/saturn.db')
 N8N_BASE = 'http://localhost:5678/api/v1'
 WORKFLOWS_DIR = Path('/home/navin/Workspace/Saturn/configs/workflows')
-SKILLS_DIR = Path('/home/navin/Workspace/Saturn/skills/n8n-skills/skills')
+BASE_PATH = Path(os.environ.get('SATURN_BASE_PATH', str(Path.home() / 'Workspace' / 'Saturn'))).expanduser().resolve()
+SKILLS_DIR = BASE_PATH / 'skills' / 'n8n'
 ERROR_TYPES = {'API_ERROR', 'AUTH_ERROR', 'RATE_LIMIT', 'NETWORK_ERROR', 'DB_ERROR', 'LOGIC_ERROR'}
 
 

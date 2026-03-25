@@ -1,6 +1,6 @@
 # Saturn
 
-Local-first operations and automation system for lead handling, outreach drafting, workflow delivery, reporting, and monitoring.
+Local-first operations engine for lead handling, outreach drafting, workflow delivery, reporting, monitoring, and strict tool execution.
 
 ## Source Of Truth
 
@@ -12,13 +12,17 @@ Read [docs/SATURN_CANONICAL_SPEC.md](/home/navin/Workspace/Saturn/docs/SATURN_CA
 - MCP/tools: `configs/saturn-server.py`
 - Database: `database/saturn.db`
 - Workflows: `configs/workflows/`
+- Control layer: `.saturn/`
+- Skills: `skills/n8n/`, `skills/core/`, `skills/ai/`
 
 ## Core Rules
 
 - Notion sync is direct API only and must not use the LLM.
 - LLM use is reserved for generation, reasoning, and content tasks.
 - Gemini rate limits must be handled centrally.
-- Historical or audit docs must not control behavior.
+- Agent roles stay isolated and actions route through tools.
+- Historical or stale docs must not control behavior.
+- No UI is part of the runtime repo.
 
 ## Local Start
 

@@ -121,7 +121,7 @@ DATABASE_DIR = BASE_PATH / "database"
 LOGS_DIR = BASE_PATH / "logs"
 DB_PATH = DATABASE_DIR / "saturn.db"
 SECURITY_LOG = LOGS_DIR / "security.log"
-SKILLS_DIR = Path('/home/navin/Workspace/Saturn/skills/n8n-skills/skills')
+SKILLS_DIR = BASE_PATH / "skills" / "n8n"
 
 
 def read_skill(skill_name: str) -> str:
@@ -1296,7 +1296,7 @@ def daily_report() -> str:
     try:
         _conn_guard.execute("BEGIN IMMEDIATE")
         _existing = _conn_guard.execute(
-            "SELECT id FROM agent_log WHERE action=? AND date(ts)=? LIMIT 1",
+            "SELECT id FROM agent_log WHERE action=? AND detail=? LIMIT 1",
             ("daily_report_guard", _today_str),
         ).fetchone()
         if _existing:
@@ -2528,6 +2528,7 @@ async def hunter_linkedin_search(query: str, limit: int = 10) -> str:
     finally:
         conn.close()
 
+# Notion sync is direct API only. No LLM tokens are consumed here.
 @server.tool()
 async def notion_sync_report(report_data: str) -> str:
     """Sync daily report data to Notion database."""

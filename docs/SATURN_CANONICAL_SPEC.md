@@ -30,6 +30,11 @@ Saturn must never:
 ## 4. Canonical Execution Rules
 - Runtime behavior is defined by current code plus this spec.
 - Markdown files outside this spec are descriptive only unless they explicitly defer here.
+- Saturn uses an OpenClaw-style split between runtime code and the `.saturn/` control layer.
+- Agent instructions live in `.saturn/agents/` and must stay role-isolated.
+- One agent owns one role. No agent may call another agent's private logic directly.
+- Actions must be exposed and executed through centralized tools.
+- Tool execution must return structured JSON at the API boundary.
 - Local timers and scripts must fail safely, log clearly, and avoid duplicate daily execution.
 - Daily report deduplication must be enforced in runtime logic, not only by scheduler timing.
 - LLM usage is allowed only for generation, reasoning, summarization, scoring, or content tasks that need it.
@@ -53,6 +58,7 @@ Saturn must never:
 ## 7. Canonical GitHub / Repo Policy
 - The repo must be Git-ready, lean, and professional.
 - Secrets, env files, databases, logs, caches, generated UI artifacts, and workspace state must stay ignored.
+- The live repo keeps no UI runtime, no nested repo wrappers, and no duplicate control layers.
 - Vendor or third-party docs do not define Saturn behavior.
 - Historical audit docs may be archived outside the repo when they are stale, conflicting, or contain sensitive information.
 - README stays short and accurate and points to this canonical spec.
@@ -61,6 +67,7 @@ Saturn must never:
 - Keep only the markdown docs needed for current operation and onboarding.
 - Archive stale or uncertain Saturn-specific docs outside the repo rather than deleting them blindly.
 - Remove generated weight that is safe to recreate: caches, compiled files, logs, local build output, local dependency trees, and transient workspace state.
+- Keep the skill layer minimal and flat under `skills/core/`, `skills/n8n/`, and `skills/ai/`.
 - Do not remove runtime Python files, core configs, real workflows in use, database files, or this canonical spec.
 
 ## 9. Canonical V1 Lock Policy
@@ -75,6 +82,7 @@ Saturn must never:
 ### Saturn
 - Orchestrates shared state, core tools, summaries, and operator-facing control surfaces.
 - Owns local operational truth in SQLite and high-level system coordination.
+- Owns centralized tool governance and control-layer alignment.
 
 ### Hunter
 - Finds, qualifies, and stores leads through deterministic ingestion paths.
@@ -88,6 +96,7 @@ Saturn must never:
 ### Forge
 - Builds and validates automation workflows and supporting delivery assets.
 - Must follow current runtime constraints and deployment-safe workflow rules.
+- Uses the `skills/n8n/` skill set only.
 
 ### Pulse
 - Produces plans, reports, summaries, and cadence checks.
@@ -99,5 +108,6 @@ Saturn must never:
 
 ## 11. Remaining Markdown Rules
 - README is a short entrypoint and must link here.
+- `.saturn/SATURN.md` governs the control layer and must remain aligned with this file.
 - Any retained Saturn markdown file must explicitly defer to this file.
 - If a Saturn markdown file conflicts with this spec, this spec wins automatically.

@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../../configs/base_path.env"
 
 ensure_saturn_dirs() {
-  mkdir -p "$LOGS_DIR" "$DATABASE_DIR" "$DOCS_DIR" "$BACKUPS_DIR" "$TEMP_DIR" "$ARCHIVE_DIR" "$ASSETS_DIR/images" "$ASSETS_DIR/videos" "$ASSETS_DIR/media"
+  mkdir -p "$LOGS_DIR" "$DATABASE_DIR" "$DOCS_DIR" "$SKILLS_DIR" "$CONTROL_DIR"
 }
 
 require_base_path() {

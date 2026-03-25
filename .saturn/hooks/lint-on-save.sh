@@ -7,4 +7,5 @@ fi
 
 case "$1" in
   *.py) python3 -m py_compile "$1" ;;
+  *.sh) bash -n "$1" ;;
 esac

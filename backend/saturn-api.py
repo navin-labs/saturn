@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-import importlib.util
-import inspect
 import json
 import os
 import re
@@ -18,6 +16,8 @@ from urllib.request import urlopen
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+
+from modules.tool_registry import ToolExecutionError, ToolNotFoundError, ToolRegistry
 
 # --- Path Setup ---
 BASE_PATH = Path(
@@ -34,9 +34,9 @@ TOOL_CALL_TIMEOUT_SEC = 30
 _SCHEMA_INIT_LOCK = threading.Lock()
 _SCHEMA_READY = False
 UI_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://localhost:4173",
-    "http://localhost:8787",
+    origin.strip()
+    for origin in os.environ.get("SATURN_ALLOWED_ORIGINS", "http://localhost:8787").split(",")
+    if origin.strip()
 ]
 
 app = Flask(__name__)
@@ -549,22 +549,14 @@ def latest_error_message(conn: sqlite3.Connection) -> str:
     return "None"
 
 
-_mcp_module = None
+_tool_registry: ToolRegistry | None = None
 
 
-def load_mcp_module():
-    global _mcp_module
-    if _mcp_module is not None:
-        return _mcp_module
-    if not MCP_SERVER_PATH.exists():
-        raise FileNotFoundError(f"MCP server not found: {MCP_SERVER_PATH}")
-    spec = importlib.util.spec_from_file_location("saturn_mcp_server", str(MCP_SERVER_PATH))
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Unable to load MCP server module")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    _mcp_module = module
-    return module
+def get_tool_registry() -> ToolRegistry:
+    global _tool_registry
+    if _tool_registry is None:
+        _tool_registry = ToolRegistry(MCP_SERVER_PATH)
+    return _tool_registry
 
 
 def check_openclaw_status() -> str:
@@ -610,13 +602,6 @@ def build_tool_error(
     return {"ok": False, "tool": tool, "error": err}
 
 
-def _dispatch_tool(tool_fn, args: dict):
-    """Call a tool via the correct sync/async path."""
-    if inspect.iscoroutinefunction(tool_fn):
-        return asyncio.run(tool_fn(**args))
-    return tool_fn(**args)
-
-
 def _normalize_tool_args(tool: str, args: dict) -> dict:
     normalized = dict(args or {})
     if tool == "add_task" and "title" not in normalized and "task" in normalized:
@@ -626,18 +611,18 @@ def _normalize_tool_args(tool: str, args: dict) -> dict:
 
 def run_mcporter_tool(tool: str, args: dict) -> tuple[dict, int]:
     try:
-        module = load_mcp_module()
-        tool_fn = getattr(module, tool, None)
-        if tool_fn is None:
-            return build_tool_error(tool, "not_found", f"Tool '{tool}' not found"), 404
-        args = _normalize_tool_args(tool, args)
-        result = _dispatch_tool(tool_fn, args)
-        return {"ok": True, "tool": tool, "result": result}, 200
+        registry = get_tool_registry()
+        result = registry.execute(tool, _normalize_tool_args(tool, args))
+        return result, 200
+    except ToolNotFoundError as exc:
+        return build_tool_error(tool, exc.error_type, exc.message), exc.status_code
+    except ToolExecutionError as exc:
+        return build_tool_error(tool, exc.error_type, exc.message), exc.status_code
     except Exception as exc:
         return build_tool_error(tool, "execution_error", str(exc)[:300]), 500
 
 
-# --- CORS for local UI ---
+# --- CORS for local API clients ---
 @app.after_request
 def add_cors_headers(response):
     origin = request.headers.get("Origin", "")
@@ -963,12 +948,12 @@ def saturn_approve_internal(draft_id: int, action: str, new_text: str = ""):
             return jsonify({"status": "failed", "message": "new_text is required for edit"}), 400
 
         command = f"/{action} {draft_id}"
-        module = load_mcp_module()
-        tool_fn = getattr(module, "process_approval_command", None)
-        if tool_fn is None:
-            return jsonify({"status": "failed", "message": "process_approval_command not available"}), 500
-
-        result_message = _dispatch_tool(tool_fn, {"command": command, "text": new_text})
+        registry = get_tool_registry()
+        payload = registry.execute(
+            "process_approval_command",
+            {"command": command, "text": new_text},
+        )
+        result_message = payload.get("result")
         msg = str(result_message or "")
         lower_msg = msg.lower()
         status = "ok"
@@ -1033,6 +1018,14 @@ def api_tools_call():
 
     result, status_code = run_mcporter_tool(tool, args)
     return jsonify(result), status_code
+
+
+@app.route("/api/tools", methods=["GET"])
+def api_tools_list():
+    try:
+        return jsonify({"ok": True, "tools": get_tool_registry().list_tools()})
+    except Exception as exc:
+        return jsonify(build_tool_error("tools", "execution_error", str(exc)[:300])), 500
 
 
 @app.route("/api/saturn/revenue", methods=["GET"])

@@ -1,7 +1,6 @@
 # Saturn
 
-- Owns system coordination and operational truth.
-- Uses SQLite as the first source for status and decisions.
-- Routes all LLM work through the central queue.
-- Never lets stale docs override the canonical spec.
-- Never uses the LLM for Notion sync, logging, or simple writes.
+- Orchestrates tools, shared state, and control decisions.
+- Does not own specialist lead, outreach, workflow, report, or alert logic.
+- Routes actions through the centralized tool layer only.
+- Keeps runtime aligned with the canonical spec and `.saturn`.

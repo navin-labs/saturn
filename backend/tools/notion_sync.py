@@ -848,12 +848,36 @@ class NotionSync:
         return self.upsert("revenue", sid, props)
 
     def sync_task(self, task: dict) -> tuple[dict, str]:
+        # Notion sync is direct API only. No LLM tokens are consumed here.
         """Sync a SQLite `tasks` row to Notion."""
         sid   = task.get("saturn_id") or _make_sid("task")
         props = {"Task Name": _title(task.get("task") or task.get("name") or "Untitled")}
-        if task.get("priority"):  props["Priority"] = _select(task["priority"].capitalize())
-        if task.get("status"):    props["Status"]   = _select(task["status"].capitalize())
-        if task.get("agent"):     props["Owner"]    = _select(task["agent"])
+        priority_value = str(task.get("priority") or "").strip().lower()
+        priority_map = {
+            "low": "Low",
+            "normal": "Medium",
+            "medium": "Medium",
+            "high": "High",
+            "critical": "Critical",
+        }
+        status_value = str(task.get("status") or "").strip().lower().replace("-", "_")
+        status_map = {
+            "new": "Backlog",
+            "backlog": "Backlog",
+            "pending": "Todo",
+            "todo": "Todo",
+            "doing": "Doing",
+            "in_progress": "Doing",
+            "review": "Review",
+            "done": "Done",
+            "complete": "Done",
+            "completed": "Done",
+        }
+        if priority_value in priority_map:
+            props["Priority"] = _select(priority_map[priority_value])
+        if status_value in status_map:
+            props["Status"] = _select(status_map[status_value])
+        # Owner is a Notion people field. Skip raw agent-name strings to keep task sync fail-open.
         if task.get("due_date"):  props["Due Date"] = _date(str(task["due_date"])[:10])
         return self.upsert("tasks", sid, props)
 

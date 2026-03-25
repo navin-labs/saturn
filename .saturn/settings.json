@@ -2,8 +2,9 @@
   "source_of_truth": "docs/SATURN_CANONICAL_SPEC.md",
   "allow_commands": [
     "python3 -m py_compile",
-    "bash scripts/",
-    "systemctl --user",
+    "bash -n scripts/",
+    "systemctl --user is-active saturn-api",
+    "systemctl --user restart saturn-api",
     "git status",
     "git diff"
   ],
@@ -12,7 +13,9 @@
     "telegram.env",
     "secrets/",
     "rm -rf /",
-    "curl http",
-    "curl https"
+    "git push --force",
+    "curl http://",
+    "curl https://",
+    "cat *.env"
   ]
 }
