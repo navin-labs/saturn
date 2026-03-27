@@ -12,11 +12,16 @@ Based on: token bucket algorithm used in production LLM systems.
 Reference: rateLLMiter (llmonpy/ratellmiter), smooths requests over the minute
            rather than bursting at start.
 """
+import datetime
 import logging
 import os
 import random
+import sqlite3
 import threading
 import time
+
+from backend.path_guard import enforce_write_path
+from configs.paths import DB_PATH
 
 logger = logging.getLogger("saturn.llm_queue")
 
@@ -31,6 +36,7 @@ _MAX_BACKOFF = 60.0
 # -- RATE LIMIT STATE (module-level, shared across all callers) --------------
 _last_call_time = 0.0
 _call_lock = threading.Lock()
+_token_log_lock = threading.Lock()
 
 # -- MODEL FALLBACK CHAIN ----------------------------------------------------
 # Format depends on SDK - set at runtime from saturn-server.py
@@ -95,12 +101,78 @@ def _is_rate_limit_error(err: Exception) -> bool:
     )
 
 
-def call_llm_queued(
+def _db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(enforce_write_path(DB_PATH, "sqlite-db-write")), timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=10000")
+    return conn
+
+
+def _today_ist() -> str:
+    tz_ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    return datetime.datetime.now(tz=tz_ist).date().isoformat()
+
+
+def _agent_tokens_today(conn: sqlite3.Connection, agent: str) -> int:
+    safe_agent = (agent or "saturn").strip().lower() or "saturn"
+    today = _today_ist()
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(tokens_used), 0)
+        FROM token_usage_log
+        WHERE log_date=? AND lower(agent)=lower(?)
+        """,
+        (today, safe_agent),
+    ).fetchone()
+    return int(row[0] or 0)
+
+
+def _extract_token_count(response: object) -> int:
+    usage = getattr(response, "usage_metadata", None) if response is not None else None
+    if usage is None:
+        return 0
+
+    total = getattr(usage, "total_token_count", None)
+    if total is not None:
+        try:
+            return max(0, int(total))
+        except (TypeError, ValueError):
+            pass
+
+    parts = []
+    for attr in ("prompt_token_count", "candidates_token_count", "cached_content_token_count"):
+        value = getattr(usage, attr, None)
+        if value is None:
+            continue
+        try:
+            parts.append(max(0, int(value)))
+        except (TypeError, ValueError):
+            continue
+    return sum(parts)
+
+
+def _log_token_usage(conn: sqlite3.Connection, agent: str, action: str, tokens_used: int) -> None:
+    safe_agent = (agent or "saturn").strip().lower() or "saturn"
+    safe_action = (action or "llm_call").strip() or "llm_call"
+    safe_tokens = max(0, int(tokens_used or 0))
+    today = _today_ist()
+    conn.execute(
+        """
+        INSERT INTO token_usage_log (agent, action, tokens_used, log_date)
+        VALUES (?,?,?,?)
+        """,
+        (safe_agent, safe_action, safe_tokens, today),
+    )
+
+
+def call_llm(
     prompt: str,
     system: str = "",
     max_tokens: int = 1000,
     model_override: str = "",
-) -> str:
+    agent: str = "saturn",
+    action: str = "llm_call",
+) -> str | dict:
     """
     Central LLM call with:
     - Shared rate limit (token bucket, smooths burst)
@@ -112,6 +184,9 @@ def call_llm_queued(
     """
     import google.generativeai as genai
 
+    safe_agent = (agent or "saturn").strip().lower() or "saturn"
+    safe_action = (action or "llm_call").strip() or "llm_call"
+
     genai.configure(api_key=os.environ.get("GOOGLE_API_KEY", ""))
     full_prompt = f"{system}\n\n{prompt}" if system else prompt
 
@@ -120,6 +195,14 @@ def call_llm_queued(
     model_chain = [model for model in model_chain if not (model in seen or seen.add(model))]
 
     last_error = None
+    with _db_conn() as conn:
+        if _agent_tokens_today(conn, safe_agent) >= 50000:
+            return {
+                "status": "quota_blocked",
+                "service": "llm",
+                "agent": safe_agent,
+                "detail": "daily token limit reached",
+            }
 
     for model_name in model_chain:
         backoff = _BASE_BACKOFF
@@ -137,6 +220,9 @@ def call_llm_queued(
                 text = _response_text_or_empty(response)
                 if not text:
                     raise ValueError(f"{model_name} returned empty response")
+                with _db_conn() as conn:
+                    _log_token_usage(conn, safe_agent, safe_action, _extract_token_count(response))
+                    conn.commit()
                 return text
             except Exception as err:
                 last_error = err
@@ -157,6 +243,24 @@ def call_llm_queued(
 
     raise RuntimeError(
         f"[Saturn] All LLM models exhausted after {_MAX_RETRIES} attempts. Last error: {last_error}"
+    )
+
+
+def call_llm_queued(
+    prompt: str,
+    system: str = "",
+    max_tokens: int = 1000,
+    model_override: str = "",
+    agent: str = "saturn",
+    action: str = "llm_call",
+) -> str | dict:
+    return call_llm(
+        prompt,
+        system=system,
+        max_tokens=max_tokens,
+        model_override=model_override,
+        agent=agent,
+        action=action,
     )
 
 

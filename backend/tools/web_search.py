@@ -13,7 +13,8 @@ ERROR_TYPES = {"API_ERROR", "AUTH_ERROR", "RATE_LIMIT", "NETWORK_ERROR", "DB_ERR
 
 
 def utc_now() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat()
+    tz_ist = dt.timezone(dt.timedelta(hours=5, minutes=30))
+    return dt.datetime.now(tz=tz_ist).replace(microsecond=0).isoformat()
 
 
 def db_conn() -> sqlite3.Connection:
@@ -53,7 +54,9 @@ def log_error(
 
 
 def ensure_service_counter(conn: sqlite3.Connection, service: str, provider: str) -> sqlite3.Row:
-    today = dt.date.today().isoformat()
+    today = dt.datetime.now(
+        tz=dt.timezone(dt.timedelta(hours=5, minutes=30))
+    ).date().isoformat()
     conn.execute(
         """
         INSERT OR IGNORE INTO api_usage_log
@@ -95,7 +98,13 @@ def increment_service_counter(conn: sqlite3.Connection, service: str) -> None:
         SET call_count=COALESCE(call_count,0)+1, called_at=?
         WHERE service=? AND usage_date=? AND endpoint='daily_counter'
         """,
-        (utc_now(), service, dt.date.today().isoformat()),
+        (
+            utc_now(),
+            service,
+            dt.datetime.now(
+                tz=dt.timezone(dt.timedelta(hours=5, minutes=30))
+            ).date().isoformat(),
+        ),
     )
 
 

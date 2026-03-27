@@ -175,6 +175,16 @@ c.execute(
 )
 
 c.execute(
+    """CREATE TABLE IF NOT EXISTS agent_runs (
+    run_id TEXT PRIMARY KEY,
+    agent TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    status TEXT NOT NULL DEFAULT 'running'
+)"""
+)
+
+c.execute(
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_leads_website_norm ON leads(website_norm) WHERE website_norm IS NOT NULL"
 )
 c.execute(
@@ -197,6 +207,9 @@ c.execute(
 )
 c.execute(
     "CREATE INDEX IF NOT EXISTS idx_error_log_ts ON error_log(ts)"
+)
+c.execute(
+    "CREATE INDEX IF NOT EXISTS idx_agent_runs_agent_time ON agent_runs(agent, started_at DESC)"
 )
 
 conn.commit()

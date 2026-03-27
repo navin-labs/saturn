@@ -74,7 +74,7 @@ except Exception:
 
 try:
     from backend.tools.skill_email_writer import (
-        outreach_prompt as _ew_outreach,
+        outreach_prompt,
         followup_prompt as _ew_followup,
         reply_prompt as _ew_reply,
         validate as _ew_validate,
@@ -300,20 +300,21 @@ def _start_llm_worker() -> None:
 
 
 def call_llm(prompt: str, system: str = "", max_tokens: int = 1000,
-             agent: str = "saturn") -> str:
+             agent: str = "saturn", action: str = "llm_call") -> str | dict:
     """
     Central LLM call - routes through the shared rate limiter.
     All burst protection, retry, and fallback handled in llm_queue.py.
     """
     try:
         from backend.modules.llm_queue import call_llm_queued
-        return call_llm_queued(prompt, system=system, max_tokens=max_tokens)
+        return call_llm_queued(prompt, system=system, max_tokens=max_tokens, agent=agent, action=action)
     except Exception as e:
         raise RuntimeError(f"[Saturn:{agent}] LLM call failed: {e}") from e
 
 
-def utc_now() -> str:
-    return datetime.datetime.utcnow().replace(microsecond=0).isoformat()
+def utc_now() -> datetime.datetime:
+    tz_ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    return datetime.datetime.now(tz=tz_ist)
 
 
 def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -362,6 +363,13 @@ def ensure_operational_schema(conn: sqlite3.Connection) -> None:
         message TEXT NOT NULL,
         detail TEXT,
         ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS agent_runs (
+        run_id TEXT PRIMARY KEY,
+        agent TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        status TEXT NOT NULL DEFAULT 'running'
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -504,6 +512,7 @@ def ensure_operational_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_token_log_agent_action_day ON token_log(agent, action, logged_at)"
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_runs_agent_time ON agent_runs(agent, started_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_system_alerts_agent_title_day ON system_alerts(agent, title, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_token_usage_agent_day ON token_usage_log(agent, log_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_service_day ON api_usage_log(service, usage_date, paused)")
@@ -701,6 +710,27 @@ def log_agent(
         "INSERT INTO agent_log (agent, action, detail, result, ts) VALUES (?,?,?,?,?)",
         (agent, action, detail, result, utc_now()),
     )
+
+
+def _sentinel_log_check(conn, check_name: str, status: str, message: str) -> None:
+    """Write one sentinel check result to system_alerts. Skip if identical record exists today."""
+    existing = conn.execute(
+        """SELECT id FROM system_alerts
+           WHERE agent='sentinel' AND title=?
+           AND date(created_at)=date('now', '+5 hours', '+30 minutes')
+           AND resolved=0
+           LIMIT 1""",
+        (check_name,)
+    ).fetchone()
+    if existing and status == "ok":
+        return
+    level = "info" if status == "ok" else ("warn" if status == "degraded" else "critical")
+    conn.execute(
+        """INSERT INTO system_alerts (agent, title, level, source, message, resolved, created_at)
+           VALUES ('sentinel', ?, ?, 'sentinel', ?, 0, datetime('now', '+5 hours', '+30 minutes'))""",
+        (check_name, level, message[:300])
+    )
+    conn.commit()
 
 
 def log_api_call(
@@ -958,7 +988,7 @@ def send_telegram_message(message: str, thread_key: str = "THREAD_ALERTS", alert
             exists = conn.execute(
                 """
                 SELECT id FROM system_alerts
-                WHERE alert_type=? AND date(created_at)=date('now')
+                WHERE alert_type=? AND date(created_at)=date('now', '+5 hours', '+30 minutes')
                 LIMIT 1
                 """,
                 (safe_alert_type,),
@@ -1020,7 +1050,7 @@ def create_system_alert_once(
     agent, title = _normalize_alert_identity(source, message)
     existing = conn.execute(
         """
-        SELECT id FROM system_alerts WHERE agent=? AND title=? AND DATE(created_at)=DATE('now', 'localtime')
+        SELECT id FROM system_alerts WHERE agent=? AND title=? AND DATE(created_at)=DATE('now', '+5 hours', '+30 minutes')
         """,
         (agent, title),
     ).fetchone()
@@ -1044,7 +1074,7 @@ def create_system_alert_once(
             "message": message,
             "error_type": error_type,
             "resolved": 0,
-            "created_at": utc_now(),
+            "created_at": utc_now().isoformat(),
         }
         run_async_tool(notion_sync_alert(json.dumps(alert_dict)))
     except Exception:
@@ -1092,7 +1122,7 @@ def ensure_service_daily_counter_row(conn: sqlite3.Connection, service: str) -> 
             """
             UPDATE api_usage_log
             SET quota_limit=?
-            WHERE service=? AND call_date=DATE('now','localtime') AND endpoint='daily_counter' AND (quota_limit IS NULL OR quota_limit<=0)
+            WHERE service=? AND call_date=date('now', '+5 hours', '+30 minutes') AND endpoint='daily_counter' AND (quota_limit IS NULL OR quota_limit<=0)
             """,
             (quota_limit, service_lc),
         )
@@ -1105,7 +1135,7 @@ def service_is_paused(conn: sqlite3.Connection, service: str) -> bool:
         """
         SELECT COALESCE(paused,0)
         FROM api_usage_log
-        WHERE service=? AND call_date=date('now') AND endpoint='daily_counter'
+        WHERE service=? AND call_date=date('now', '+5 hours', '+30 minutes') AND endpoint='daily_counter'
         LIMIT 1
         """,
         (service_lc,),
@@ -1119,7 +1149,7 @@ def hunter_api_calls_today(conn: sqlite3.Connection, provider: str = "serpapi") 
         """
         SELECT call_count
         FROM api_usage_log
-        WHERE lower(service)='hunter' AND call_date=date('now') AND endpoint='daily_counter'
+        WHERE lower(service)='hunter' AND call_date=date('now', '+5 hours', '+30 minutes') AND endpoint='daily_counter'
         LIMIT 1
         """
     ).fetchone()
@@ -1133,7 +1163,7 @@ def hunter_api_calls_today(conn: sqlite3.Connection, provider: str = "serpapi") 
         WHERE lower(agent)='hunter'
           AND lower(provider)=lower(?)
           AND lower(status)='success'
-          AND date(called_at)=date('now')
+          AND date(called_at)=date('now', '+5 hours', '+30 minutes')
           AND (endpoint IS NULL OR endpoint!='daily_counter')
         """,
         (provider,),
@@ -1153,7 +1183,7 @@ def hunter_increment_daily_usage(conn: sqlite3.Connection) -> None:
         """
         UPDATE api_usage_log
         SET call_count=COALESCE(call_count,0)+1, called_at=?
-        WHERE service='hunter' AND call_date=date('now') AND endpoint='daily_counter'
+        WHERE service='hunter' AND call_date=date('now', '+5 hours', '+30 minutes') AND endpoint='daily_counter'
         """,
         (now,),
     )
@@ -1500,7 +1530,9 @@ Only the email.
         body = ""
         raw = ""
         for attempt in range(3):
-            raw = call_llm(prompt, max_tokens=350, agent="echo")
+            raw = call_llm(prompt, max_tokens=350, agent="echo", action="echo_write_outreach")
+            if isinstance(raw, dict):
+                return raw
             text = raw.strip()
             subject = "Quick question"
             if text.lower().startswith("subject:"):
@@ -1548,7 +1580,9 @@ def echo_write_followup(
         return {"status": "error", "reason": "email writer not loaded"}
     try:
         prompt = _ew_followup(sender_name, contact_name, original_summary, followup_number)
-        body = call_llm(prompt, max_tokens=150)
+        body = call_llm(prompt, max_tokens=150, agent="echo", action="echo_write_followup")
+        if isinstance(body, dict):
+            return body
         return {"status": "success", "body": body.strip(), "followup_number": followup_number}
     except Exception as e:
         return {"status": "error", "reason": str(e)}
@@ -1566,7 +1600,9 @@ def echo_write_reply(
         return {"status": "error", "reason": "email writer not loaded"}
     try:
         prompt = _ew_reply(sender_name, contact_name, their_message, context)
-        body = call_llm(prompt, max_tokens=200)
+        body = call_llm(prompt, max_tokens=200, agent="echo", action="echo_write_reply")
+        if isinstance(body, dict):
+            return body
         return {"status": "success", "body": body.strip()}
     except Exception as e:
         return {"status": "error", "reason": str(e)}
@@ -1577,7 +1613,22 @@ def sentinel_health_report() -> dict:
     """Full system health: API, n8n, SQLite, disk, timers."""
     if not _self_heal_ok:
         return {"status": "error", "reason": "self_heal not loaded"}
-    return _sh_report()
+    report = _sh_report()
+    conn = db_conn()
+    try:
+        api_result = report.get("api", {})
+        _sentinel_log_check(conn, "api_health", str(api_result.get("status") or "error"), json.dumps(api_result))
+        n8n_result = report.get("n8n", {})
+        _sentinel_log_check(conn, "n8n_health", str(n8n_result.get("status") or "error"), json.dumps(n8n_result))
+        db_result = report.get("db", {})
+        _sentinel_log_check(conn, "db_health", str(db_result.get("status") or "error"), json.dumps(db_result))
+        disk_result = report.get("disk", {})
+        _sentinel_log_check(conn, "disk_health", str(disk_result.get("status") or "error"), json.dumps(disk_result))
+        timers_result = report.get("timers", {})
+        _sentinel_log_check(conn, "timers_health", str(timers_result.get("status") or "error"), json.dumps(timers_result))
+    finally:
+        conn.close()
+    return report
 
 
 @mcp.tool()
@@ -1609,7 +1660,10 @@ def echo_linkedin_connection(
         return {"status": "error", "reason": "linkedin skill not loaded"}
     try:
         prompt = _li_conn(sender_name, contact_name, role, company, reason)
-        msg = call_llm(prompt, max_tokens=80).strip()
+        msg = call_llm(prompt, max_tokens=80, agent="echo", action="echo_linkedin_connection")
+        if isinstance(msg, dict):
+            return msg
+        msg = msg.strip()
         if len(msg) > 300:
             msg = msg[:277] + "..."
         return {"status": "success", "message": msg, "chars": len(msg)}
@@ -1631,7 +1685,10 @@ def echo_linkedin_inmail(
         return {"status": "error", "reason": "linkedin skill not loaded"}
     try:
         prompt = _li_inmail(sender_name, contact_name, role, company, pain_point, service)
-        msg = call_llm(prompt, max_tokens=250).strip()
+        msg = call_llm(prompt, max_tokens=250, agent="echo", action="echo_linkedin_inmail")
+        if isinstance(msg, dict):
+            return msg
+        msg = msg.strip()
         return {"status": "success", "message": msg}
     except Exception as e:
         return {"status": "error", "reason": str(e)}
@@ -1644,7 +1701,9 @@ def hunter_score_profile(profile_text: str, niche: str) -> dict:
         return {"status": "error", "reason": "linkedin skill not loaded"}
     try:
         prompt = _li_score(profile_text, niche)
-        raw = call_llm(prompt, max_tokens=300)
+        raw = call_llm(prompt, max_tokens=300, agent="hunter", action="hunter_score_profile")
+        if isinstance(raw, dict):
+            return raw
         return _li_parse(raw)
     except Exception as e:
         return {"status": "error", "reason": str(e)}
@@ -1739,7 +1798,9 @@ def log_token_usage(conn: sqlite3.Connection, agent: str, action: str, tokens_us
     safe_agent = (agent or "saturn").strip().lower()
     safe_action = (action or "general").strip() or "general"
     safe_tokens = max(0, int(tokens_used or 0))
-    today = datetime.date.today().isoformat()
+    today = datetime.datetime.now(
+        tz=datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    ).date().isoformat()
     now = utc_now()
     conn.execute(
         """
@@ -1763,7 +1824,7 @@ def log_token_usage(conn: sqlite3.Connection, agent: str, action: str, tokens_us
         existing_alert = conn.execute(
             """
             SELECT id FROM agent_log
-            WHERE date(ts)=date('now')
+            WHERE date(ts)=date('now', '+5 hours', '+30 minutes')
               AND lower(agent)='saturn'
               AND lower(action)='token_usage_alert'
               AND lower(detail) LIKE lower(?)
@@ -1818,7 +1879,7 @@ def log_tokens(
         log_token_usage(conn, agent, action, int(tokens_used or 0))
         total_today = int(
             conn.execute(
-                "SELECT COALESCE(SUM(tokens),0) FROM token_log WHERE date(logged_at)=date('now')"
+                "SELECT COALESCE(SUM(tokens),0) FROM token_log WHERE date(logged_at)=date('now', '+5 hours', '+30 minutes')"
             ).fetchone()[0]
             or 0
         )
@@ -1836,7 +1897,9 @@ def token_usage_today() -> str:
     """Check token usage today vs configured daily limit."""
     conn = db()
     try:
-        today = datetime.date.today().isoformat()
+        today = datetime.datetime.now(
+            tz=datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+        ).date().isoformat()
         rows = conn.execute(
             """
             SELECT SUM(tokens), model, COALESCE(agent,'saturn')
@@ -1923,7 +1986,7 @@ async def add_lead(name: str, company: str = '', contact: str = '',
                 conn.execute(
                     """
                     SELECT COUNT(*) FROM leads
-                    WHERE date(created_at)=date('now') AND lower(source) LIKE '%hunter%'
+                    WHERE date(created_at)=date('now', '+5 hours', '+30 minutes') AND lower(source) LIKE '%hunter%'
                     """
                 ).fetchone()[0]
                 or 0
@@ -2188,6 +2251,56 @@ def classify_hunter_api_error(message: str, status_code: int | None = None) -> s
     return "API_ERROR"
 
 
+def _insert_hunter_lead(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    company: str,
+    contact: str,
+    source: str,
+    notes: str,
+    email: str = "",
+    value: float = 0,
+) -> tuple[str, int | None]:
+    website_norm = normalize_website(contact)
+    if not website_norm:
+        return "invalid", None
+
+    resolved_email, email_status, email_source = resolve_hunter_email(conn, email, notes, website_norm)
+    cursor = conn.execute(
+        """
+        INSERT OR IGNORE INTO leads (
+            name, company, contact, website, website_norm, source, value_estimate, notes,
+            email, email_status, email_source, status, created_at, updated_at
+        )
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            name,
+            company,
+            contact,
+            contact,
+            website_norm,
+            source,
+            value,
+            notes,
+            resolved_email,
+            email_status,
+            email_source,
+            "new",
+            utc_now(),
+            utc_now(),
+        ),
+    )
+    if int(cursor.rowcount or 0) == 0:
+        existing = conn.execute(
+            "SELECT id FROM leads WHERE website_norm=? OR contact=? LIMIT 1",
+            (website_norm, contact),
+        ).fetchone()
+        return "duplicate", int(existing["id"]) if existing else None
+    return "inserted", int(cursor.lastrowid)
+
+
 @mcp.tool()
 async def hunter_extract_leads(
     niche: str = "",
@@ -2204,12 +2317,18 @@ async def hunter_extract_leads(
     leads_added = 0
     leads_skipped = 0
     errors = 0
+    extracted_count = 0
+    deduped_count = 0
+    inserted_count = 0
     query_used = ""
     requested_limit = min(max(int(limit or RESULTS_PER_PAGE), 1), 10)
 
     def finish(status: str, payload: dict, result: str) -> str:
         detail = json.dumps(
             {
+                "extracted_count": extracted_count,
+                "deduped_count": deduped_count,
+                "inserted_count": inserted_count,
                 "leads_added": leads_added,
                 "leads_skipped": leads_skipped,
                 "errors": errors,
@@ -2373,6 +2492,34 @@ async def hunter_extract_leads(
                     conn=conn,
                 )
                 if isinstance(linkedin_results, list) and linkedin_results:
+                    extracted_count = len(linkedin_results[:requested_limit])
+                    for item in linkedin_results[:requested_limit]:
+                        contact = str(item.get("profile_url") or item.get("link") or "").strip()
+                        insert_status, _lead_id = _insert_hunter_lead(
+                            conn,
+                            name=str(item.get("name") or "").strip() or "LinkedIn Prospect",
+                            company=str(item.get("company") or "").strip(),
+                            contact=contact,
+                            source="linkedin-hunter-fallback",
+                            notes="Found via Hunter LinkedIn fallback.",
+                            email=str(item.get("email") or "").strip(),
+                        )
+                        if insert_status == "inserted":
+                            leads_added += 1
+                            inserted_count += 1
+                        elif insert_status == "duplicate":
+                            leads_skipped += 1
+                            deduped_count += 1
+                        else:
+                            errors += 1
+                            log_error(
+                                conn,
+                                "hunter",
+                                "lead_extraction",
+                                "LOGIC_ERROR",
+                                "Lead rejected: invalid fallback contact",
+                                contact,
+                            )
                     log_agent(
                         conn,
                         "Hunter",
@@ -2386,14 +2533,15 @@ async def hunter_extract_leads(
                             "query": query_used,
                             "page": 1,
                             "results_processed": len(linkedin_results),
-                            "leads_added": 0,
-                            "leads_skipped": 0,
+                            "leads_added": leads_added,
+                            "leads_skipped": leads_skipped,
                             "errors": errors,
                             "fallback": "linkedin",
                             "results": linkedin_results,
                         },
-                        "success",
+                        "success" if errors == 0 else "completed_with_errors",
                     )
+        extracted_count = len(rows[:requested_limit])
         for item in rows[:requested_limit]:
             contact = str(item.get("link") or "").strip()
             website_norm = normalize_website(contact)
@@ -2425,9 +2573,9 @@ async def hunter_extract_leads(
             )
 
             try:
-                cursor.execute(
+                insert_cursor = cursor.execute(
                     """
-                    INSERT INTO leads (
+                    INSERT OR IGNORE INTO leads (
                         name, company, contact, website, website_norm, source, value_estimate, notes,
                         email, email_status, email_source, status, created_at, updated_at
                     )
@@ -2450,16 +2598,30 @@ async def hunter_extract_leads(
                         utc_now(),
                     ),
                 )
-            except sqlite3.IntegrityError:
-                leads_skipped += 1
-                continue
             except sqlite3.Error as exc:
                 errors += 1
                 log_error(conn, "hunter", "lead_extraction", "DB_ERROR", "Lead insert failed", str(exc)[:500])
                 return finish("failed", {"error_type": "DB_ERROR", "reason": "insert_failed"}, "failed")
+            if int(insert_cursor.rowcount or 0) == 0:
+                leads_skipped += 1
+                deduped_count += 1
+                continue
             leads_added += 1
+            inserted_count += 1
 
-        log_agent(conn, "Hunter", "lead_extraction_skip_count", json.dumps({"skipped": leads_skipped}), "success")
+        log_agent(
+            conn,
+            "Hunter",
+            "lead_extraction_counts",
+            json.dumps(
+                {
+                    "extracted_count": extracted_count,
+                    "deduped_count": deduped_count,
+                    "inserted_count": inserted_count,
+                }
+            ),
+            "success",
+        )
         return finish(
             "ok",
             {
@@ -2662,13 +2824,14 @@ async def trigger_echo_draft(lead_id: int) -> str:
         conn.close()
         return f"Lead {lead_id} has no email. Draft skipped safely."
     message = build_echo_draft_text(name, company)
+    draft_text = message
 
     draft = conn.execute(
         """
-        INSERT INTO content_queue (content_type, title, body, platform, status, lead_id, created_at)
-        VALUES ('outreach', ?, ?, 'email', 'pending', ?, ?)
+        INSERT INTO outreach_drafts (lead_id, draft_text, status, created_at)
+        VALUES (?, ?, 'pending', datetime('now', '+5 hours', '+30 minutes'))
         """,
-        (f"{name} ({company})", message, lead_id, utc_now()),
+        (lead_id, draft_text),
     )
     draft_id = int(draft.lastrowid)
     if _notion:
@@ -2726,6 +2889,106 @@ async def trigger_echo_draft(lead_id: int) -> str:
     conn.commit()
     conn.close()
     return f"Approval request sent for lead {lead_id}, draft {draft_id}"
+
+@mcp.tool()
+def trigger_echo_for_pending_leads(limit: int = 10) -> dict:
+    """Create pending outreach drafts for existing eligible leads without drafts."""
+    conn = db_conn()
+    drafted = 0
+    skipped = 0
+    errors = 0
+    run_id = f"run_echo_{int(time.time() * 1000000)}"
+    started_at = int(time.time())
+    try:
+        conn.execute(
+            """
+            INSERT INTO agent_runs (run_id, agent, started_at, ended_at, status)
+            VALUES (?, 'echo', ?, NULL, 'running')
+            """,
+            (run_id, started_at),
+        )
+        conn.commit()
+        batch_limit = max(1, int(limit or 10))
+        rows = conn.execute(
+            """
+            SELECT id, name, company, email
+            FROM leads
+            WHERE email_status IN ('verified','guessed','found')
+              AND manual_override = 0
+              AND id NOT IN (SELECT lead_id FROM outreach_drafts)
+            LIMIT ?
+            """,
+            (batch_limit,),
+        ).fetchall()
+
+        if not rows:
+            conn.execute(
+                "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
+                (int(time.time()), "ok", run_id),
+            )
+            conn.commit()
+            return {
+                "status": "ok",
+                "drafted": 0,
+                "skipped": 0,
+                "errors": 0,
+                "detail": "no eligible leads",
+            }
+
+        for lead in rows:
+            lead_id = int(lead["id"])
+            company = str(lead["company"] or "").strip()
+            prompt = f"Write a short cold email to {company}"
+            result = call_llm(prompt=prompt, agent="echo", action="outreach_draft")
+
+            if isinstance(result, dict):
+                status = str(result.get("status") or "llm_error")
+                detail = str(result.get("detail") or result)
+                if status == "quota_blocked":
+                    conn.execute(
+                        "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
+                        (int(time.time()), "quota_blocked", run_id),
+                    )
+                    conn.commit()
+                    return result
+                log_error(conn, "echo", "draft_generation", "LOGIC_ERROR", detail, str(lead_id))
+                errors += 1
+                conn.commit()
+                continue
+
+            raw = str(result or "").strip()
+            conn.execute(
+                """
+                INSERT INTO outreach_drafts (lead_id, draft_text, status, created_at)
+                VALUES (?, ?, 'pending', datetime('now', '+5 hours', '+30 minutes'))
+                """,
+                (lead_id, raw[:1000]),
+            )
+            log_agent(conn, "echo", "draft_created", f"lead_id={lead_id}", "ok")
+            drafted += 1
+            conn.commit()
+
+        conn.execute(
+            "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
+            (int(time.time()), "ok", run_id),
+        )
+        conn.commit()
+        return {"status": "ok", "drafted": drafted, "skipped": skipped, "errors": errors}
+    except Exception as exc:
+        log_error(conn, "echo", "outreach_draft", "LOGIC_ERROR", str(exc)[:300], "")
+        conn.execute(
+            "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
+            (int(time.time()), "error", run_id),
+        )
+        conn.commit()
+        return {
+            "status": "error",
+            "error": "LOGIC_ERROR",
+            "detail": str(exc)[:300],
+            "agent": "echo",
+        }
+    finally:
+        conn.close()
 
 @mcp.tool()
 async def list_leads(status: str = 'all') -> str:
@@ -2957,7 +3220,13 @@ def increment_service_daily_usage(conn: sqlite3.Connection, service: str) -> Non
         SET call_count=COALESCE(call_count,0)+1, called_at=?
         WHERE service=? AND call_date=? AND endpoint='daily_counter'
         """,
-        (now, service_lc, datetime.date.today().isoformat()),
+        (
+            now,
+            service_lc,
+            datetime.datetime.now(
+                tz=datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+            ).date().isoformat(),
+        ),
     )
 
 
@@ -3025,6 +3294,31 @@ async def send_outreach_email(
     """Send outreach email with 1 retry max, daily cap, and categorized failures."""
     conn = db_conn()
     try:
+        if draft_id and draft_id > 0:
+            draft_row = conn.execute(
+                "SELECT id, lead_id, draft_text, status FROM outreach_drafts WHERE id=?",
+                (draft_id,)
+            ).fetchone()
+            if not draft_row:
+                return {"status": "error", "error": "draft_not_found",
+                        "detail": f"draft_id {draft_id} does not exist"}
+            already_sent = conn.execute(
+                "SELECT 1 FROM email_send_log WHERE draft_id=? AND lower(status)='sent' LIMIT 1",
+                (draft_id,),
+            ).fetchone()
+            if already_sent:
+                return json.dumps({"status": "ok", "detail": "already_sent"})
+            if str(draft_row["status"]).lower() != "approved":
+                return {"status": "error", "error": "draft_not_approved",
+                        "detail": f"draft_id {draft_id} status is '{draft_row['status']}', must be 'approved'"}
+            if int(draft_row["lead_id"]) != int(lead_id):
+                return {"status": "error", "error": "lead_mismatch",
+                        "detail": f"draft lead_id {draft_row['lead_id']} does not match lead_id {lead_id}"}
+            body = str(draft_row["draft_text"] or "").strip()
+            if not body:
+                return {"status": "error", "error": "empty_draft",
+                        "detail": f"draft_id {draft_id} has empty draft_text"}
+
         lead = conn.execute(
             "SELECT email, status, email_status FROM leads WHERE id=?",
             (lead_id,),
@@ -3058,7 +3352,7 @@ async def send_outreach_email(
             conn.execute(
                 """
                 SELECT COUNT(*) FROM email_send_log
-                WHERE date(sent_at)=date('now') AND lower(status)='sent'
+                WHERE date(sent_at)=date('now', '+5 hours', '+30 minutes') AND lower(status)='sent'
                 """
             ).fetchone()[0]
             or 0
@@ -3303,13 +3597,13 @@ async def list_due_followups(limit: int = 10) -> str:
         WHERE status='contacted'
           AND COALESCE(follow_up_count,0) < 2
           AND COALESCE(manual_override,0)=0
-          AND date(COALESCE(follow_up_due_at, created_at)) <= date('now')
+          AND date(COALESCE(follow_up_due_at, created_at)) <= date('now', '+5 hours', '+30 minutes')
           AND NOT EXISTS (
               SELECT 1
               FROM email_send_log es
               WHERE es.lead_id=leads.id
                 AND lower(COALESCE(es.status,'')) IN ('inbound','reply_received','replied')
-                AND date(COALESCE(es.sent_at, es.created_at)) >= date('now','-3 day')
+                AND date(COALESCE(es.sent_at, es.created_at)) >= date('now', '+5 hours', '+30 minutes', '-3 day')
           )
         ORDER BY date(COALESCE(follow_up_due_at, created_at)) ASC, id ASC
         LIMIT ?
@@ -3393,7 +3687,7 @@ async def send_follow_up(lead_id: int, approved: bool = False) -> str:
         conn.close()
         return json.dumps({"status": "failed", "error_type": "LOGIC_ERROR", "reason": "missing_followup_due"})
     due_row = conn.execute(
-        "SELECT date(?) <= date('now')",
+        "SELECT date(?) <= date('now', '+5 hours', '+30 minutes')",
         (follow_due_at,),
     ).fetchone()
     is_due = bool(due_row and int(due_row[0] or 0) == 1)
@@ -3408,7 +3702,7 @@ async def send_follow_up(lead_id: int, approved: bool = False) -> str:
         SELECT COUNT(*) FROM email_send_log
         WHERE lead_id=?
           AND lower(COALESCE(status,'')) IN ('inbound','reply_received','replied')
-          AND date(COALESCE(sent_at, created_at)) >= date('now','-3 day')
+          AND date(COALESCE(sent_at, created_at)) >= date('now', '+5 hours', '+30 minutes', '-3 day')
         """,
         (lead_id,),
     ).fetchone()
@@ -3502,7 +3796,8 @@ async def process_approval_command(command: str, text: str = "") -> str:
         conn.close()
         return "Draft not found"
 
-    if (draft["status"] or "").strip().lower() != "pending":
+    draft_status = (draft["status"] or "").strip().lower()
+    if draft_status not in {"pending", "approved"}:
         conn.close()
         return "Draft already processed"
 
@@ -3518,7 +3813,14 @@ async def process_approval_command(command: str, text: str = "") -> str:
     lead_name = (lead_row["name"] or "Lead").strip() or "Lead"
     draft_text = str(draft["draft_text"] or "").strip()
 
-    if action == "approve":
+    if action == "approve" and draft_status == "approved":
+        sent_row = conn.execute(
+            "SELECT 1 FROM email_send_log WHERE draft_id=? AND lower(status)='sent' LIMIT 1",
+            (draft_id,),
+        ).fetchone()
+        if sent_row:
+            conn.close()
+            return f"✅ Draft {draft_id} already sent to {lead_name}"
         conn.close()
         send_result_raw = await send_outreach_email(
             lead_id=lead_id,
@@ -3527,9 +3829,95 @@ async def process_approval_command(command: str, text: str = "") -> str:
             draft_id=draft_id,
         )
         send_status = ""
+        send_detail = ""
         try:
-            send_payload = json.loads(send_result_raw)
+            send_payload = (
+                send_result_raw
+                if isinstance(send_result_raw, dict)
+                else json.loads(send_result_raw)
+            )
             send_status = str(send_payload.get("status") or "").lower()
+            send_detail = str(send_payload.get("detail") or "").lower()
+        except Exception as exc:
+            conn_log = db_conn()
+            log_error(
+                conn_log,
+                "echo",
+                "approval_command",
+                "LOGIC_ERROR",
+                "Email send response parse failed",
+                str(exc)[:500],
+            )
+            conn_log.commit()
+            conn_log.close()
+        if send_status == "ok" and send_detail == "already_sent":
+            conn2 = db_conn()
+            processed_at = utc_now()
+            conn2.execute(
+                "UPDATE outreach_drafts SET status='sent', processed_at=? WHERE id=?",
+                (processed_at, draft_id),
+            )
+            log_agent(conn2, "Echo", "approval_approved", f"draft_id={draft_id}", "success")
+            conn2.commit()
+            conn2.close()
+            return f"✅ Draft {draft_id} already sent to {lead_name}"
+        if send_status != "sent":
+            conn_retry = db_conn()
+            conn_retry.execute(
+                "UPDATE outreach_drafts SET status='pending' WHERE id=?",
+                (draft_id,),
+            )
+            conn_retry.commit()
+            conn_retry.close()
+            return f"Send failed for draft {draft_id}"
+        conn2 = db_conn()
+        processed_at = utc_now()
+        conn2.execute(
+            "UPDATE outreach_drafts SET status='sent', processed_at=? WHERE id=?",
+            (processed_at, draft_id),
+        )
+        log_agent(conn2, "Echo", "approval_approved", f"draft_id={draft_id}", "success")
+        if _notion:
+            try:
+                _notion.sync_draft(
+                    {
+                        "saturn_id": f"draft_{lead_id}_{draft_id}",
+                        "name": f"Outreach to {lead_id}",
+                        "body": draft_text or "",
+                        "status": "Sent",
+                        "channel": "Email",
+                        "agent": "Echo",
+                    }
+                )
+            except Exception as _e:
+                pass
+        conn2.commit()
+        conn2.close()
+        return f"✅ Draft {draft_id} approved and sent to {lead_name}"
+
+    if action == "approve":
+        conn.execute(
+            "UPDATE outreach_drafts SET status='approved', processed_at=datetime('now','+5 hours','+30 minutes') WHERE id=?",
+            (draft_id,)
+        )
+        conn.commit()
+        conn.close()
+        send_result_raw = await send_outreach_email(
+            lead_id=lead_id,
+            subject=f"Follow-up from SATURN",
+            body=draft_text,
+            draft_id=draft_id,
+        )
+        send_status = ""
+        send_detail = ""
+        try:
+            send_payload = (
+                send_result_raw
+                if isinstance(send_result_raw, dict)
+                else json.loads(send_result_raw)
+            )
+            send_status = str(send_payload.get("status") or "").lower()
+            send_detail = str(send_payload.get("detail") or "").lower()
         except Exception as exc:
             conn_log = db_conn()
             log_error(
@@ -3543,7 +3931,16 @@ async def process_approval_command(command: str, text: str = "") -> str:
             conn_log.commit()
             conn_log.close()
             send_status = ""
+        if send_status == "ok" and send_detail == "already_sent":
+            send_status = "sent"
         if send_status != "sent":
+            conn_retry = db_conn()
+            conn_retry.execute(
+                "UPDATE outreach_drafts SET status='pending' WHERE id=?",
+                (draft_id,),
+            )
+            conn_retry.commit()
+            conn_retry.close()
             return f"Send failed for draft {draft_id}"
         conn2 = db_conn()
         processed_at = utc_now()
@@ -3883,7 +4280,7 @@ async def system_health() -> str:
         """
         SELECT lower(agent) AS agent, SUM(tokens_used) AS total_tokens
         FROM token_usage_log
-        WHERE log_date=date('now')
+        WHERE log_date=date('now', '+5 hours', '+30 minutes')
         GROUP BY lower(agent), log_date
         ORDER BY total_tokens DESC
         """

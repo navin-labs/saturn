@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import shutil
 import threading
+import uuid
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request
@@ -17,7 +18,10 @@ from urllib.request import urlopen
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from modules.tool_registry import ToolExecutionError, ToolNotFoundError, ToolRegistry
+try:
+    from modules.tool_registry import ToolExecutionError, ToolNotFoundError, ToolRegistry
+except ModuleNotFoundError:
+    from backend.modules.tool_registry import ToolExecutionError, ToolNotFoundError, ToolRegistry
 
 # --- Path Setup ---
 BASE_PATH = Path(
@@ -28,7 +32,7 @@ MCP_SERVER_PATH = BASE_PATH / "configs" / "saturn-server.py"
 MCPORTER_CONFIG_PATH = Path(
     os.environ.get("SATURN_MCPORTER_CONFIG", "/home/navin/config/mcporter.json")
 ).expanduser().resolve()
-SERVER_STARTED_AT = dt.datetime.utcnow()
+SERVER_STARTED_AT = dt.datetime.now(tz=dt.timezone(dt.timedelta(hours=5, minutes=30)))
 TOKEN_QUOTA_DAILY = 500_000
 TOOL_CALL_TIMEOUT_SEC = 30
 _SCHEMA_INIT_LOCK = threading.Lock()
@@ -106,6 +110,13 @@ def ensure_operational_schema(conn: sqlite3.Connection) -> None:
         detail TEXT,
         called_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS agent_runs (
+        run_id TEXT PRIMARY KEY,
+        agent TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        status TEXT NOT NULL DEFAULT 'running'
+    )""")
     add_column_if_missing(conn, "leads", "website TEXT")
     add_column_if_missing(conn, "leads", "website_norm TEXT")
     add_column_if_missing(conn, "leads", "email TEXT")
@@ -149,6 +160,7 @@ def ensure_operational_schema(conn: sqlite3.Connection) -> None:
         "ON api_usage_log(service, usage_date, endpoint) "
         "WHERE service IS NOT NULL AND usage_date IS NOT NULL AND endpoint IS NOT NULL"
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_runs_agent_time ON agent_runs(agent, started_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_system_alerts_agent_title_day ON system_alerts(agent, title, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_error_log_resolved_ts ON error_log(resolved, ts)")
     conn.commit()
@@ -207,7 +219,8 @@ def query_scalar(conn: sqlite3.Connection, sql: str, params: tuple = ()):
 
 
 def now_utc() -> dt.datetime:
-    return dt.datetime.utcnow()
+    tz_ist = dt.timezone(dt.timedelta(hours=5, minutes=30))
+    return dt.datetime.now(tz=tz_ist)
 
 
 def format_uptime() -> str:
@@ -247,7 +260,7 @@ def compute_summary(conn: sqlite3.Connection) -> dict:
             """,
         )
     )
-    leads_today = int(query_scalar(conn, "SELECT COUNT(*) FROM leads WHERE date(created_at)=date('now')"))
+    leads_today = int(query_scalar(conn, "SELECT COUNT(*) FROM leads WHERE date(created_at)=date('now', '+5 hours', '+30 minutes')"))
     leads_total = int(query_scalar(conn, "SELECT COUNT(*) FROM leads"))
     tasks_pending = int(query_scalar(conn, "SELECT COUNT(*) FROM tasks WHERE status='pending'"))
     emails_today = int(
@@ -256,7 +269,7 @@ def compute_summary(conn: sqlite3.Connection) -> dict:
             """
             SELECT COUNT(*)
             FROM agent_log
-            WHERE date(ts)=date('now')
+            WHERE date(ts)=date('now', '+5 hours', '+30 minutes')
               AND lower(agent)='echo'
               AND (lower(action) LIKE '%email%' OR lower(action) LIKE '%outreach%' OR lower(action) LIKE '%draft%')
             """,
@@ -270,20 +283,20 @@ def compute_summary(conn: sqlite3.Connection) -> dict:
             FROM leads
             WHERE status='contacted'
               AND COALESCE(follow_up_count,0) < 2
-              AND datetime(COALESCE(last_contact, created_at)) <= datetime('now','-3 day')
+              AND datetime(COALESCE(last_contact, created_at)) <= datetime('now', '+5 hours', '+30 minutes', '-3 day')
             """,
         )
     )
     token_usage_today = int(
-        query_scalar(conn, "SELECT COALESCE(SUM(tokens),0) FROM token_log WHERE date(logged_at)=date('now')")
+        query_scalar(conn, "SELECT COALESCE(SUM(tokens),0) FROM token_log WHERE date(logged_at)=date('now', '+5 hours', '+30 minutes')")
     )
     api_calls_today = int(
-        query_scalar(conn, "SELECT COUNT(*) FROM api_usage_log WHERE date(called_at)=date('now')")
+        query_scalar(conn, "SELECT COUNT(*) FROM api_usage_log WHERE date(called_at)=date('now', '+5 hours', '+30 minutes')")
     )
     hunter_api_calls_today = int(
         query_scalar(
             conn,
-            "SELECT COUNT(*) FROM api_usage_log WHERE date(called_at)=date('now') AND lower(agent)='hunter'",
+            "SELECT COUNT(*) FROM api_usage_log WHERE date(called_at)=date('now', '+5 hours', '+30 minutes') AND lower(agent)='hunter'",
         )
     )
     hunter_api_limit = int(os.environ.get("SATURN_HUNTER_API_DAILY_LIMIT", "100"))
@@ -296,7 +309,7 @@ def compute_summary(conn: sqlite3.Connection) -> dict:
                COALESCE(action, 'general') AS action,
                SUM(tokens) AS token_total
         FROM token_log
-        WHERE date(logged_at)=date('now')
+        WHERE date(logged_at)=date('now', '+5 hours', '+30 minutes')
         GROUP BY lower(COALESCE(agent, 'saturn')), COALESCE(action, 'general')
         ORDER BY token_total DESC
         LIMIT 5
@@ -374,7 +387,7 @@ def compute_agent_status(conn: sqlite3.Connection) -> list[dict]:
         SELECT lower(agent) AS agent,
                COUNT(*) AS task_count
         FROM agent_log
-        WHERE date(ts)=date('now')
+        WHERE date(ts)=date('now', '+5 hours', '+30 minutes')
         GROUP BY lower(agent)
         """
     ).fetchall()
@@ -439,7 +452,7 @@ def compute_agent_status(conn: sqlite3.Connection) -> list[dict]:
         """
         SELECT lower(COALESCE(agent, 'saturn')) AS agent, SUM(tokens) AS token_total
         FROM token_log
-        WHERE date(logged_at)=date('now')
+        WHERE date(logged_at)=date('now', '+5 hours', '+30 minutes')
         GROUP BY lower(COALESCE(agent, 'saturn'))
         """
     ).fetchall()
@@ -609,17 +622,135 @@ def _normalize_tool_args(tool: str, args: dict) -> dict:
     return normalized
 
 
-def run_mcporter_tool(tool: str, args: dict) -> tuple[dict, int]:
+def _agent_for_tool(tool: str) -> str:
+    tool_lc = str(tool or "").strip().lower()
+    prefix = tool_lc.split("_", 1)[0]
+    if prefix in AGENT_CONFIG:
+        return prefix
+    if tool_lc in {
+        "add_lead",
+        "check_lead_exists",
+    }:
+        return "hunter"
+    if tool_lc in {
+        "trigger_echo_draft",
+        "send_outreach",
+        "send_outreach_email",
+        "record_email_bounce",
+        "list_due_followups",
+        "send_follow_up",
+        "process_approval_command",
+    }:
+        return "echo"
+    if tool_lc == "create_project":
+        return "forge"
+    return "saturn"
+
+
+def _tool_run_status(payload: dict) -> str:
+    result = payload.get("result_json")
+    if result is None:
+        result = payload.get("result")
+    if isinstance(result, dict):
+        status = str(result.get("status") or "").strip().lower()
+        if status:
+            return status
+    return "success"
+
+
+def _execute_tool_with_run_log(tool: str, args: dict) -> tuple[dict, int]:
+    payload = _normalize_tool_args(tool, args)
+    agent = _agent_for_tool(tool)
+    started_at = int(now_utc().timestamp())
+    requested_run_id = str(payload.get("run_id") or "").strip()
+    run_id = requested_run_id or ""
+
+    try:
+        for attempt in range(3):
+            if not run_id:
+                run_id = f"run_{agent}_{started_at}_{uuid.uuid4().hex[:6]}"
+            try:
+                with get_db_conn() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO agent_runs (run_id, agent, started_at, ended_at, status)
+                        VALUES (?, ?, ?, NULL, 'running')
+                        """,
+                        (run_id, agent, started_at),
+                    )
+                    conn.commit()
+                break
+            except sqlite3.IntegrityError:
+                if attempt == 2:
+                    run_id = ""
+                else:
+                    run_id = ""
+                    continue
+    except Exception:
+        run_id = ""
+
     try:
         registry = get_tool_registry()
-        result = registry.execute(tool, _normalize_tool_args(tool, args))
+        result = registry.execute(tool, payload)
+        if run_id:
+            with get_db_conn() as conn:
+                conn.execute(
+                    "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
+                    (int(now_utc().timestamp()), _tool_run_status(result), run_id),
+                )
+                conn.commit()
         return result, 200
     except ToolNotFoundError as exc:
+        if run_id:
+            with get_db_conn() as conn:
+                conn.execute(
+                    "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
+                    (int(now_utc().timestamp()), exc.error_type, run_id),
+                )
+                conn.commit()
         return build_tool_error(tool, exc.error_type, exc.message), exc.status_code
     except ToolExecutionError as exc:
+        if run_id:
+            with get_db_conn() as conn:
+                conn.execute(
+                    "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
+                    (int(now_utc().timestamp()), exc.error_type, run_id),
+                )
+                conn.commit()
         return build_tool_error(tool, exc.error_type, exc.message), exc.status_code
     except Exception as exc:
+        if run_id:
+            with get_db_conn() as conn:
+                conn.execute(
+                    "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
+                    (int(now_utc().timestamp()), "execution_error", run_id),
+                )
+                conn.commit()
         return build_tool_error(tool, "execution_error", str(exc)[:300]), 500
+
+
+def run_mcporter_tool(tool: str, args: dict) -> tuple[dict, int]:
+    return _execute_tool_with_run_log(tool, args)
+
+
+def _tool_result_message(payload: dict) -> str:
+    raw_result = payload.get("raw_result")
+    if isinstance(raw_result, str):
+        return raw_result
+
+    result = payload.get("result_json")
+    if result is None:
+        result = payload.get("result")
+
+    if isinstance(result, dict):
+        for key in ("message", "result", "reason", "status"):
+            value = result.get(key)
+            if value:
+                return str(value)
+        return json.dumps(result)
+    if isinstance(result, list):
+        return json.dumps(result)
+    return str(result or "")
 
 
 # --- CORS for local API clients ---
@@ -948,13 +1079,13 @@ def saturn_approve_internal(draft_id: int, action: str, new_text: str = ""):
             return jsonify({"status": "failed", "message": "new_text is required for edit"}), 400
 
         command = f"/{action} {draft_id}"
-        registry = get_tool_registry()
-        payload = registry.execute(
+        payload, status_code = _execute_tool_with_run_log(
             "process_approval_command",
             {"command": command, "text": new_text},
         )
-        result_message = payload.get("result")
-        msg = str(result_message or "")
+        if status_code != 200:
+            return jsonify({"status": "failed", "message": _tool_result_message(payload)}), status_code
+        msg = _tool_result_message(payload)
         lower_msg = msg.lower()
         status = "ok"
         if "failed" in lower_msg or "not found" in lower_msg or "invalid" in lower_msg:
@@ -1132,6 +1263,7 @@ def saturn_health_full():
 
     return jsonify(
         {
+            "status": "ok",
             "n8n": n8n,
             "openclaw": openclaw,
             "db_tables": db_table_names,
@@ -1141,6 +1273,17 @@ def saturn_health_full():
             "last_morning_plan": last_morning_plan["ts"] if last_morning_plan else "",
             "last_report": last_report["ts"] if last_report else "",
             "email_reader_last_run": "",
+        }
+    )
+
+
+@app.route("/healthz", methods=["GET"])
+def saturn_healthz():
+    return jsonify(
+        {
+            "status": "ok",
+            "service": "saturn-api",
+            "uptime": format_uptime(),
         }
     )
 
@@ -1211,7 +1354,7 @@ def saturn_system_health():
             token_usage_today = int(
                 query_scalar(
                     conn,
-                    "SELECT COALESCE(SUM(tokens),0) FROM token_log WHERE date(logged_at)=date('now')",
+                    "SELECT COALESCE(SUM(tokens),0) FROM token_log WHERE date(logged_at)=date('now', '+5 hours', '+30 minutes')",
                 )
             )
             restart_count = int(
@@ -1241,6 +1384,7 @@ def saturn_system_health():
 
     return jsonify(
         {
+            "status": "ok",
             "n8n": n8n_status,
             "db": db_status,
             "apiQuotaRemaining": api_quota_remaining,

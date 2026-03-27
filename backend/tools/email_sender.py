@@ -14,8 +14,10 @@ MAX_RETRY = 1
 ERROR_TYPES = {"API_ERROR", "AUTH_ERROR", "RATE_LIMIT", "NETWORK_ERROR", "DB_ERROR", "LOGIC_ERROR"}
 
 
-def utc_now() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat()
+def _ist_now() -> dt.datetime:
+    return dt.datetime.now(
+        tz=dt.timezone(dt.timedelta(hours=5, minutes=30))
+    )
 
 
 def db_conn() -> sqlite3.Connection:
@@ -30,13 +32,13 @@ def db_conn() -> sqlite3.Connection:
 def log_agent(conn: sqlite3.Connection, agent: str, action: str, detail: str, result: str) -> None:
     conn.execute(
         "INSERT INTO agent_log (agent, action, detail, result, ts) VALUES (?,?,?,?,?)",
-        (agent, action, detail[:500], result[:200], utc_now()),
+        (agent, action, detail[:500], result[:200], _ist_now().replace(microsecond=0).isoformat()),
     )
 
 
 def log_error(conn: sqlite3.Connection, action: str, error_type: str, message: str, detail: str = "") -> None:
     safe_type = error_type if error_type in ERROR_TYPES else "LOGIC_ERROR"
-    now = utc_now()
+    now = _ist_now().replace(microsecond=0).isoformat()
     conn.execute(
         "INSERT INTO error_log (agent, action, error_type, message, detail, ts) VALUES (?,?,?,?,?,?)",
         ("Echo", action, safe_type, message[:300], detail[:500], now),
@@ -71,7 +73,14 @@ def log_send_attempt(
         INSERT INTO email_send_log (lead_id, draft_id, status, attempt_count, error_category, sent_at)
         VALUES (?,?,?,?,?,?)
         """,
-        (lead_id, draft_id if draft_id > 0 else None, status, attempt_count, error_category or None, utc_now()),
+        (
+            lead_id,
+            draft_id if draft_id > 0 else None,
+            status,
+            attempt_count,
+            error_category or None,
+            _ist_now().replace(microsecond=0).isoformat(),
+        ),
     )
 
 
@@ -152,7 +161,7 @@ def send_email(to, subject, body, lead_id, draft_id) -> dict:
                 if draft_id > 0:
                     conn.execute(
                         "UPDATE outreach_drafts SET status='sent', processed_at=? WHERE id=?",
-                        (utc_now(), draft_id),
+                        (_ist_now().replace(microsecond=0).isoformat(), draft_id),
                     )
                 log_agent(
                     conn,
@@ -171,7 +180,7 @@ def send_email(to, subject, body, lead_id, draft_id) -> dict:
                 if bounce and lead_id > 0:
                     conn.execute(
                         "UPDATE leads SET email_status='bounced', updated_at=? WHERE id=?",
-                        (utc_now(), lead_id),
+                        (_ist_now().replace(microsecond=0).isoformat(), lead_id),
                     )
                     log_error(conn, "send_email", "API_ERROR", "smtp bounce detected", str(exc))
                     conn.commit()

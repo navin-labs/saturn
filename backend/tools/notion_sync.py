@@ -52,7 +52,7 @@ import time
 import uuid
 import sqlite3
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -474,13 +474,16 @@ def _saturn_id(sid: str) -> dict:
     return {"rich_text": [{"text": {"content": sid}}]}
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    tz_ist = timezone(timedelta(hours=5, minutes=30))
+    return datetime.now(tz_ist).isoformat()
 
 def _today_iso() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+    tz_ist = timezone(timedelta(hours=5, minutes=30))
+    return datetime.now(tz_ist).date().isoformat()
 
 def _make_sid(prefix: str) -> str:
-    ts  = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    tz_ist = timezone(timedelta(hours=5, minutes=30))
+    ts  = datetime.now(tz_ist).strftime("%Y%m%d%H%M%S%f")
     uid = uuid.uuid4().hex[:6]
     return f"{prefix}_{ts}_{uid}"
 
@@ -662,7 +665,7 @@ class NotionSync:
 
     def acquire_lock(self, agent: str, timeout_seconds: int = 300) -> bool:
         conn     = self._conn()
-        now_ts   = int(datetime.now(timezone.utc).timestamp())
+        now_ts   = int(datetime.now(timezone(timedelta(hours=5, minutes=30))).timestamp())
         cutoff   = now_ts - timeout_seconds
         conn.execute("DELETE FROM agent_lock WHERE locked_at < ?", (cutoff,))
         conn.commit()
@@ -691,8 +694,8 @@ class NotionSync:
 
     def start_run(self, agent: str, run_id: str = None) -> str:
         if run_id is None:
-            run_id = f"run_{agent}_{int(datetime.now(timezone.utc).timestamp())}_{uuid.uuid4().hex[:6]}"
-        now_ts = int(datetime.now(timezone.utc).timestamp())
+            run_id = f"run_{agent}_{int(datetime.now(timezone(timedelta(hours=5, minutes=30))).timestamp())}_{uuid.uuid4().hex[:6]}"
+        now_ts = int(datetime.now(timezone(timedelta(hours=5, minutes=30))).timestamp())
         conn   = self._conn()
         for attempt in range(3):
             try:
@@ -713,7 +716,7 @@ class NotionSync:
         return run_id
 
     def end_run(self, run_id: str, status: str = "success") -> float:
-        now_ts = int(datetime.now(timezone.utc).timestamp())
+        now_ts = int(datetime.now(timezone(timedelta(hours=5, minutes=30))).timestamp())
         conn   = self._conn()
         conn.execute(
             "UPDATE agent_runs SET ended_at = ?, status = ? WHERE run_id = ?",

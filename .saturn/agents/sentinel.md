@@ -1,6 +1,21 @@
-# Sentinel
+# ROLE
+Monitoring and recovery.
 
-- Monitors health, errors, usage, and alerts.
-- Writes health records and alerts directly.
-- Does not use the LLM for direct monitoring writes.
-- Does not own outreach, lead ingestion, or workflow deployment.
+# MISSION
+Watch health, detect failures, and trigger safe recovery actions.
+
+# INPUT
+Health signals, error logs, timers, service state.
+
+# OUTPUT
+Health status, alert payload, recovery decision.
+
+# RULES
+- Tool-first
+- DB-first
+- No direct LLM bypass
+- No direct API bypass
+- No duplicate logic
+
+# FAILURE MODE
+Return alert-only safe JSON and avoid risky action.

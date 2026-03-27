@@ -1,5 +1,6 @@
 {
-  "source_of_truth": "docs/SATURN_CANONICAL_SPEC.md",
+  "source_of_truth": ".saturn/SATURN.md",
+  "implementation_spec": "docs/SATURN_CANONICAL_SPEC.md",
   "allow_commands": [
     "python3 -m py_compile",
     "bash -n scripts/",

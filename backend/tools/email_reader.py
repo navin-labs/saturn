@@ -32,8 +32,10 @@ NOT_INTERESTED_TERMS = ("not interested", "unsubscribe", "remove", "stop", "no t
 OOO_SUBJECT_TERMS = ("out of office", "away", "vacation", "auto-reply")
 
 
-def utc_now() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat()
+def _ist_now() -> dt.datetime:
+    return dt.datetime.now(
+        tz=dt.timezone(dt.timedelta(hours=5, minutes=30))
+    )
 
 
 def db_conn() -> sqlite3.Connection:
@@ -48,13 +50,13 @@ def db_conn() -> sqlite3.Connection:
 def log_agent(conn: sqlite3.Connection, action: str, detail: str, result: str) -> None:
     conn.execute(
         "INSERT INTO agent_log (agent, action, detail, result, ts) VALUES (?,?,?,?,?)",
-        ("Hunter", action, detail[:500], result[:200], utc_now()),
+        ("Hunter", action, detail[:500], result[:200], _ist_now().replace(microsecond=0).isoformat()),
     )
 
 
 def log_error(conn: sqlite3.Connection, action: str, error_type: str, message: str, detail: str = "") -> None:
     safe_type = error_type if error_type in ERROR_TYPES else "LOGIC_ERROR"
-    now = utc_now()
+    now = _ist_now().replace(microsecond=0).isoformat()
     conn.execute(
         "INSERT INTO error_log (agent, action, error_type, message, detail, ts) VALUES (?,?,?,?,?,?)",
         ("Hunter", action, safe_type, message[:300], detail[:500], now),
@@ -177,31 +179,56 @@ def read_replies(max_emails: int = 20) -> list[dict]:
                 continue
 
             message = email.message_from_bytes(raw_payload)
-            sender = parseaddr(decode_value(message.get("From")))[1].lower().strip()
+            sender_email = parseaddr(message.get("From", ""))[1].strip().lower()
+            sender = sender_email
             subject = decode_value(message.get("Subject"))
             body = extract_text_body(message)
             date_header = decode_value(message.get("Date"))
-            classification = classify_reply(subject, body)
 
-            lead_row = None
-            if sender:
-                lead_row = conn.execute(
-                    "SELECT id, status FROM leads WHERE lower(email)=lower(?) LIMIT 1",
-                    (sender,),
+            lead_id = None
+            if sender_email:
+                row = conn.execute(
+                    "SELECT id FROM leads WHERE lower(trim(email))=? LIMIT 1",
+                    (sender_email,),
                 ).fetchone()
+                if row:
+                    lead_id = int(row[0])
 
-            lead_id = int(lead_row["id"]) if lead_row else None
-            if lead_row:
-                current_status = (lead_row["status"] or "").lower()
+            classification = classify_reply(subject, body)
+            if lead_id is not None:
+                reply_now = _ist_now().replace(microsecond=0).isoformat()
+                reply_logged = conn.execute(
+                    """
+                    SELECT 1
+                    FROM email_send_log
+                    WHERE lead_id=?
+                      AND lower(status)='reply_received'
+                      AND date(sent_at)=date('now', '+5 hours', '+30 minutes')
+                    LIMIT 1
+                    """,
+                    (lead_id,),
+                ).fetchone()
+                if not reply_logged:
+                    conn.execute(
+                        """
+                        INSERT INTO email_send_log (lead_id, draft_id, status, sent_at)
+                        VALUES (?, NULL, 'reply_received', ?)
+                        """,
+                        (lead_id, reply_now),
+                    )
+                current = conn.execute(
+                    "SELECT status FROM leads WHERE id=?", (lead_id,)
+                ).fetchone()
+                current_status = (current[0] or "").lower() if current else ""
                 if classification == "interested" and current_status == "contacted":
                     conn.execute(
                         "UPDATE leads SET status='qualified', updated_at=? WHERE id=?",
-                        (utc_now(), lead_id),
+                        (reply_now, lead_id),
                     )
                 elif classification == "not_interested":
                     conn.execute(
                         "UPDATE leads SET status='lost', updated_at=? WHERE id=?",
-                        (utc_now(), lead_id),
+                        (reply_now, lead_id),
                     )
 
             log_agent(
@@ -220,7 +247,7 @@ def read_replies(max_emails: int = 20) -> list[dict]:
             )
             results.append(
                 {
-                    "sender": sender,
+                    "sender": sender_email,
                     "subject": subject,
                     "classification": classification,
                     "lead_id": lead_id,

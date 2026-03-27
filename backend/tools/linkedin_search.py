@@ -19,7 +19,8 @@ DAILY_LIMIT = 20
 
 
 def utc_now() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat()
+    tz_ist = dt.timezone(dt.timedelta(hours=5, minutes=30))
+    return dt.datetime.now(tz=tz_ist).replace(microsecond=0).isoformat()
 
 
 def db_conn() -> sqlite3.Connection:
@@ -63,7 +64,9 @@ def log_error(conn: sqlite3.Connection, action: str, error_type: str, message: s
 
 
 def ensure_counter(conn: sqlite3.Connection) -> sqlite3.Row | tuple:
-    today = dt.date.today().isoformat()
+    today = dt.datetime.now(
+        tz=dt.timezone(dt.timedelta(hours=5, minutes=30))
+    ).date().isoformat()
     conn.execute(
         """
         INSERT OR IGNORE INTO api_usage_log
@@ -94,7 +97,12 @@ def increment_counter(conn: sqlite3.Connection) -> None:
         SET call_count=COALESCE(call_count,0)+1, called_at=?
         WHERE service='linkedin' AND usage_date=? AND endpoint='daily_counter'
         """,
-        (utc_now(), dt.date.today().isoformat()),
+        (
+            utc_now(),
+            dt.datetime.now(
+                tz=dt.timezone(dt.timedelta(hours=5, minutes=30))
+            ).date().isoformat(),
+        ),
     )
 
 
@@ -105,7 +113,12 @@ def pause_linkedin(conn: sqlite3.Connection) -> None:
         SET paused=1, called_at=?
         WHERE service='linkedin' AND usage_date=? AND endpoint='daily_counter'
         """,
-        (utc_now(), dt.date.today().isoformat()),
+        (
+            utc_now(),
+            dt.datetime.now(
+                tz=dt.timezone(dt.timedelta(hours=5, minutes=30))
+            ).date().isoformat(),
+        ),
     )
 
 

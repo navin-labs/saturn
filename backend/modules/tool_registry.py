@@ -95,6 +95,29 @@ def _signature_params(fn: Any) -> list[dict[str, Any]]:
     return params
 
 
+def _normalize_result_payload(result: Any) -> tuple[Any, Any]:
+    if result is None:
+        empty = {"status": "error", "reason": "empty_result"}
+        return empty, empty
+
+    if isinstance(result, (dict, list)):
+        return result, result
+
+    if isinstance(result, str):
+        text = result.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                return parsed, parsed
+            except Exception:
+                pass
+        wrapped = {"status": "ok", "result": result}
+        return wrapped, wrapped
+
+    wrapped = {"status": "ok", "result": result}
+    return wrapped, wrapped
+
+
 class ToolRegistry:
     def __init__(self, module_path: str | Path) -> None:
         self.module_path = Path(module_path).expanduser().resolve()
@@ -144,19 +167,13 @@ class ToolRegistry:
         except Exception as exc:
             raise ToolExecutionError("execution_error", str(exc)[:300], 500) from exc
 
-        parsed = None
-        if isinstance(result, str):
-            text = result.strip()
-            if text.startswith("{") or text.startswith("["):
-                try:
-                    parsed = json.loads(text)
-                except Exception:
-                    parsed = None
+        normalized, parsed = _normalize_result_payload(result)
 
         return {
             "ok": True,
             "tool": tool,
-            "result": result,
+            "result": normalized,
+            "raw_result": result,
             "result_json": parsed,
-            "result_type": type(result).__name__,
+            "result_type": type(normalized).__name__,
         }
