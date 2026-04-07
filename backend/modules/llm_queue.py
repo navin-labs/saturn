@@ -220,8 +220,10 @@ def call_llm(
                 text = _response_text_or_empty(response)
                 if not text:
                     raise ValueError(f"{model_name} returned empty response")
+                from configs.saturn_server import increment_service_daily_usage
                 with _db_conn() as conn:
                     _log_token_usage(conn, safe_agent, safe_action, _extract_token_count(response))
+                    increment_service_daily_usage(conn, "gemini")
                     conn.commit()
                 return text
             except Exception as err:

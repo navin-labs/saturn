@@ -577,6 +577,44 @@ class NotionSync:
             print(f"[Saturn] Registry version migrated: {row[0]} → {DATABASE_VERSION}")
         conn.close()
 
+    def _log_sync_error(self, action: str, error_type: str, message: str, detail: str = "") -> None:
+        conn = None
+        try:
+            conn = self._conn()
+            conn.execute("""CREATE TABLE IF NOT EXISTS error_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent TEXT NOT NULL,
+                action TEXT NOT NULL,
+                error_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                detail TEXT,
+                ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            conn.execute(
+                "INSERT INTO error_log (agent, action, error_type, message, detail, ts) VALUES (?,?,?,?,?,?)",
+                ("notion_sync", action, error_type, str(message)[:300], str(detail)[:500], _now_iso()),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _structured_error(self, action: str, exc: Exception, detail: str = "") -> dict:
+        error_type = "API_ERROR"
+        if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+            error_type = "NETWORK_ERROR"
+        elif isinstance(exc, requests.HTTPError) and exc.response is not None:
+            if exc.response.status_code in (401, 403):
+                error_type = "AUTH_ERROR"
+            elif exc.response.status_code == 429:
+                error_type = "RATE_LIMIT"
+        elif isinstance(exc, NotionAPIError) and exc.reason == "rate limited":
+            error_type = "RATE_LIMIT"
+        self._log_sync_error(action, error_type, str(exc), detail)
+        return {"status": "error", "error": error_type, "detail": str(exc)}
+
     # ── ID MAP ────────────────────────────────────────────────────────────────
 
     def _get_notion_page_id(self, saturn_id: str) -> Optional[str]:
@@ -614,32 +652,36 @@ class NotionSync:
         Saturn ID injected only on CREATE path, never on UPDATE.
         Returns (notion_page, saturn_id).
         """
-        validate_properties(db_name, properties)
-
-        existing = self._get_notion_page_id(saturn_id)
-
-        if existing:
-            # UPDATE — never touch Saturn ID
-            props_clean = {k: v for k, v in properties.items() if k != "Saturn ID"}
-            result = self.client.update_page(existing, props_clean)
-        else:
-            # CREATE — inject Saturn ID
-            props_with_sid = dict(properties)
-            props_with_sid["Saturn ID"] = _saturn_id(saturn_id)
-            result = self.client.create_page(
-                DATABASES[db_name]["database_id"], props_with_sid
-            )
-            self._register(saturn_id, result["id"], db_name)
-
         try:
-            action = "UPDATE" if existing else "CREATE"
-            self.log_agent_activity(
-                "Saturn", f"{action} {db_name}", saturn_id, "Success"
-            )
-        except Exception:
-            pass  # audit log never blocks primary write
+            validate_properties(db_name, properties)
 
-        return result, saturn_id
+            existing = self._get_notion_page_id(saturn_id)
+
+            if existing:
+                # UPDATE — never touch Saturn ID
+                props_clean = {k: v for k, v in properties.items() if k != "Saturn ID"}
+                result = self.client.update_page(existing, props_clean)
+                self._register(saturn_id, existing, db_name)
+            else:
+                # CREATE — inject Saturn ID
+                props_with_sid = dict(properties)
+                props_with_sid["Saturn ID"] = _saturn_id(saturn_id)
+                result = self.client.create_page(
+                    DATABASES[db_name]["database_id"], props_with_sid
+                )
+                self._register(saturn_id, result["id"], db_name)
+
+            try:
+                action = "UPDATE" if existing else "CREATE"
+                self.log_agent_activity(
+                    "Saturn", f"{action} {db_name}", saturn_id, "Success"
+                )
+            except Exception:
+                pass  # audit log never blocks primary write
+
+            return result, saturn_id
+        except Exception as exc:
+            return self._structured_error("upsert", exc, f"{db_name}:{saturn_id}"), saturn_id
 
     # ── HEALTH CHECK ──────────────────────────────────────────────────────────
 
@@ -650,6 +692,7 @@ class NotionSync:
             print("[Saturn] ✓ Notion connectivity OK")
             return True
         except Exception as e:
+            self._log_sync_error("health_check", "API_ERROR", str(e), "leads")
             print(f"[Saturn] ✗ Notion unreachable: {e}")
             try:
                 self.raise_alert(
@@ -923,17 +966,22 @@ class NotionSync:
                            execution_time: float = 0.0) -> dict:
         """Fast append-only activity log (no dedup check)."""
         sid = _make_sid("act")
-        return self.client.create_page(DATABASES["agent_activity"]["database_id"], {
-            "Activity":       _title(f"{agent}: {action}"),
-            "Agent":          _select(agent),
-            "Action":         _text(action),
-            "Target":         _text(target),
-            "Status":         _select(status),
-            "Execution Time": _number(execution_time),
-            "Detail":         _text(detail),
-            "Timestamp":      _date(_now_iso()),
-            "Saturn ID":      _saturn_id(sid),
-        })
+        try:
+            result = self.client.create_page(DATABASES["agent_activity"]["database_id"], {
+                "Activity":       _title(f"{agent}: {action}"),
+                "Agent":          _select(agent),
+                "Action":         _text(action),
+                "Target":         _text(target),
+                "Status":         _select(status),
+                "Execution Time": _number(execution_time),
+                "Detail":         _text(detail),
+                "Timestamp":      _date(_now_iso()),
+                "Saturn ID":      _saturn_id(sid),
+            })
+            self._register(sid, result["id"], "agent_activity")
+            return result
+        except Exception as exc:
+            return self._structured_error("log_agent_activity", exc, f"{agent}:{action}:{target}")
 
     def _find_existing_alert(self, agent: str, title: str) -> Optional[dict]:
         today = _today_iso()
@@ -963,43 +1011,52 @@ class NotionSync:
     def raise_alert(self, agent: str, title: str, message: str,
                     level: str = "Warning", source: str = "") -> dict:
         """Resolved field uses correct Notion API boolean."""
-        existing = self._find_existing_alert(agent, title)
-        if existing:
-            return {
-                "status": "skipped",
-                "reason": "duplicate_alert",
-                "page_id": existing.get("id", ""),
-            }
         sid = _make_sid("alert")
-        return self.client.create_page(DATABASES["alerts"]["database_id"], {
-            "Alert Title":     _title(title),
-            "Level":           _select(level),
-            "Agent":           _select(agent),
-            "Source":          _text(source),
-            "Message":         _text(message),
-            "Resolved":        _checkbox(False),   # bool, not string
-            "Saturn ID":       _saturn_id(sid),
-        })
+        try:
+            existing = self._find_existing_alert(agent, title)
+            if existing:
+                return {
+                    "status": "skipped",
+                    "reason": "duplicate_alert",
+                    "page_id": existing.get("id", ""),
+                }
+            result = self.client.create_page(DATABASES["alerts"]["database_id"], {
+                "Alert Title":     _title(title),
+                "Level":           _select(level),
+                "Agent":           _select(agent),
+                "Source":          _text(source),
+                "Message":         _text(message),
+                "Resolved":        _checkbox(False),   # bool, not string
+                "Saturn ID":       _saturn_id(sid),
+            })
+            self._register(sid, result["id"], "alerts")
+            return result
+        except Exception as exc:
+            return self._structured_error("raise_alert", exc, f"{agent}:{title}")
 
     def log_token_usage(self, agent: str, model: str, action: str,
                         tokens: int, cost: float) -> dict:
         """Log tokens and auto-check budget."""
         sid    = _make_sid("tok")
-        result = self.client.create_page(DATABASES["token_usage"]["database_id"], {
-            "Log Entry": _title(f"{agent} / {model}"),
-            "Agent":     _select(agent),
-            "Model":     _text(model),
-            "Action":    _text(action),
-            "Tokens":    _number(tokens),
-            "Cost":      _number(cost),
-            "Logged At": _date(_now_iso()),
-            "Saturn ID": _saturn_id(sid),
-        })
-        today = _today_iso()
-        if self._daily_cost_date == today:
-            self._daily_cost_cache += cost
-        self.check_budget()
-        return result
+        try:
+            result = self.client.create_page(DATABASES["token_usage"]["database_id"], {
+                "Log Entry": _title(f"{agent} / {model}"),
+                "Agent":     _select(agent),
+                "Model":     _text(model),
+                "Action":    _text(action),
+                "Tokens":    _number(tokens),
+                "Cost":      _number(cost),
+                "Logged At": _date(_now_iso()),
+                "Saturn ID": _saturn_id(sid),
+            })
+            self._register(sid, result["id"], "token_usage")
+            today = _today_iso()
+            if self._daily_cost_date == today:
+                self._daily_cost_cache += cost
+            self.check_budget()
+            return result
+        except Exception as exc:
+            return self._structured_error("log_token_usage", exc, f"{agent}:{model}:{action}")
 
     # ── SATURN HQ STATUS UPDATE ───────────────────────────────────────
 
@@ -1066,6 +1123,7 @@ class NotionSync:
             print(f"[Saturn] ✓ HQ status updated: {status_text}")
             return True
         except Exception as e:
+            self._log_sync_error("notion_update_hq_status", "API_ERROR", str(e), status_text)
             print(f"[Saturn] ✗ HQ status update failed: {e}")
             return False
 
@@ -1118,6 +1176,7 @@ class NotionSync:
             print(f"[Saturn] OS revenue: month '{month}' not found in table")
             return False
         except Exception as e:
+            self._log_sync_error("notion_update_os_revenue", "API_ERROR", str(e), month)
             print(f"[Saturn] ✗ OS revenue update failed: {e}")
             return False
 

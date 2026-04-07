@@ -180,6 +180,8 @@ ERROR_TYPES = {
     "NETWORK_ERROR",
     "DB_ERROR",
     "LOGIC_ERROR",
+    "LLM_FAILURE",
+    "FALLBACK_USED",
 }
 STATUS_TRANSITIONS = {
     "new": {"contacted"},
@@ -1624,6 +1626,18 @@ def sentinel_health_report() -> dict:
         _sentinel_log_check(conn, "db_health", str(db_result.get("status") or "error"), json.dumps(db_result))
         disk_result = report.get("disk", {})
         _sentinel_log_check(conn, "disk_health", str(disk_result.get("status") or "error"), json.dumps(disk_result))
+        budget_today = conn.execute(
+            "SELECT COALESCE(SUM(tokens_used),0) FROM token_usage_log "
+            "WHERE log_date=date('now','+5 hours','+30 minutes')"
+        ).fetchone()[0]
+        budget_pct = int(budget_today or 0) / 80000 * 100
+        if budget_pct >= 90:
+            b_status, b_msg = "critical", f"Token usage {budget_pct:.0f}% of daily cap"
+        elif budget_pct >= 70:
+            b_status, b_msg = "degraded", f"Token usage {budget_pct:.0f}% of daily cap"
+        else:
+            b_status, b_msg = "ok", f"Token usage normal {budget_pct:.0f}%"
+        _sentinel_log_check(conn, "budget_health", b_status, b_msg)
         timers_result = report.get("timers", {})
         _sentinel_log_check(conn, "timers_health", str(timers_result.get("status") or "error"), json.dumps(timers_result))
     finally:
@@ -1723,6 +1737,105 @@ def pulse_cost_monthly() -> dict:
     if not _cost_monitor_ok:
         return {"status": "error", "reason": "cost monitor not loaded"}
     return _cm_monthly()
+
+
+@mcp.tool()
+def get_cost_status() -> dict:
+    """Read today's cost and pipeline status without calling the LLM."""
+    conn = db_conn()
+    try:
+        system_cap = 80000
+        per_agent_cap = 30000
+        total_today = int(
+            conn.execute(
+                """
+                SELECT COALESCE(SUM(tokens_used),0)
+                FROM token_usage_log
+                WHERE log_date=date('now', '+5 hours', '+30 minutes')
+                """
+            ).fetchone()[0]
+            or 0
+        )
+        token_rows = conn.execute(
+            """
+            SELECT lower(COALESCE(agent, 'saturn')) AS agent, SUM(tokens_used) AS tokens_used
+            FROM token_usage_log
+            WHERE log_date=date('now', '+5 hours', '+30 minutes')
+            GROUP BY lower(COALESCE(agent, 'saturn'))
+            ORDER BY tokens_used DESC
+            """
+        ).fetchall()
+        api_rows = conn.execute(
+            """
+            SELECT
+                COALESCE(service, COALESCE(provider, '')) AS service,
+                COALESCE(call_count, 0) AS call_count,
+                COALESCE(paused, 0) AS paused
+            FROM api_usage_log
+            WHERE endpoint='daily_counter'
+              AND COALESCE(NULLIF(call_date, ''), NULLIF(usage_date, ''), date(called_at, '+5 hours', '+30 minutes'))
+                  = date('now', '+5 hours', '+30 minutes')
+            ORDER BY COALESCE(service, provider, agent)
+            """
+        ).fetchall()
+        pending_drafts = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM outreach_drafts WHERE lower(COALESCE(status,''))='pending'"
+            ).fetchone()[0]
+            or 0
+        )
+        emails_sent_today = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM email_send_log
+                WHERE lower(COALESCE(status,''))='sent'
+                  AND date(sent_at)=date('now', '+5 hours', '+30 minutes')
+                """
+            ).fetchone()[0]
+            or 0
+        )
+        errors_today = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM error_log
+                WHERE date(ts)=date('now', '+5 hours', '+30 minutes')
+                """
+            ).fetchone()[0]
+            or 0
+        )
+        return {
+            "status": "ok",
+            "tokens": {
+                "total_today": total_today,
+                "system_cap": system_cap,
+                "per_agent_cap": per_agent_cap,
+                "system_remaining": max(0, system_cap - total_today),
+                "by_agent": [
+                    {
+                        "agent": row["agent"],
+                        "tokens_used": int(row["tokens_used"] or 0),
+                    }
+                    for row in token_rows
+                ],
+            },
+            "api_calls": [
+                {
+                    "service": row["service"],
+                    "calls_today": int(row["call_count"] or 0),
+                    "paused": int(row["paused"] or 0),
+                }
+                for row in api_rows
+            ],
+            "pipeline": {
+                "pending_drafts": pending_drafts,
+                "emails_sent_today": emails_sent_today,
+                "errors_today": errors_today,
+            },
+        }
+    finally:
+        conn.close()
 
 
 @mcp.tool()
@@ -2891,7 +3004,7 @@ async def trigger_echo_draft(lead_id: int) -> str:
     return f"Approval request sent for lead {lead_id}, draft {draft_id}"
 
 @mcp.tool()
-def trigger_echo_for_pending_leads(limit: int = 10) -> dict:
+def trigger_echo_for_pending_leads(limit: int = 10, dry_run: bool = False, lead_id: int | None = None) -> dict:
     """Create pending outreach drafts for existing eligible leads without drafts."""
     conn = db_conn()
     drafted = 0
@@ -2909,17 +3022,59 @@ def trigger_echo_for_pending_leads(limit: int = 10) -> dict:
         )
         conn.commit()
         batch_limit = max(1, int(limit or 10))
-        rows = conn.execute(
-            """
-            SELECT id, name, company, email
+
+        query_sql = """
+            SELECT id, name, company, email, notes
             FROM leads
             WHERE email_status IN ('verified','guessed','found')
               AND manual_override = 0
               AND id NOT IN (SELECT lead_id FROM outreach_drafts)
-            LIMIT ?
-            """,
-            (batch_limit,),
-        ).fetchall()
+        """
+        query_args: tuple[object, ...]
+        if lead_id is not None:
+            query_sql += " AND id=? LIMIT 1"
+            query_args = (int(lead_id),)
+        else:
+            query_sql += " LIMIT ?"
+            query_args = (batch_limit,)
+
+        if dry_run:
+            rows = conn.execute(query_sql, query_args).fetchall()
+            conn.execute(
+                "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
+                (int(time.time()), "dry_run", run_id),
+            )
+            conn.commit()
+            return {
+                "status": "dry_run",
+                "count": len(rows),
+                "eligible_leads": [
+                    {
+                        "id": int(row["id"]),
+                        "name": row["name"],
+                        "company": row["company"],
+                    }
+                    for row in rows
+                ],
+                "estimated_tokens_per_draft": 300,
+                "estimated_total_tokens": len(rows) * 300,
+            }
+
+        conn.execute(
+            """
+            DELETE FROM outreach_drafts
+            WHERE lower(COALESCE(status,'')) IN ('pending','approved')
+              AND (
+                instr(COALESCE(draft_text,''), '[') > 0
+                OR instr(COALESCE(draft_text,''), ']') > 0
+                OR lower(COALESCE(draft_text,'')) LIKE '%please tell me%'
+                OR lower(COALESCE(draft_text,'')) NOT LIKE 'subject:%'
+              )
+            """
+        )
+        conn.commit()
+
+        rows = conn.execute(query_sql, query_args).fetchall()
 
         if not rows:
             conn.execute(
@@ -2937,32 +3092,174 @@ def trigger_echo_for_pending_leads(limit: int = 10) -> dict:
 
         for lead in rows:
             lead_id = int(lead["id"])
-            company = str(lead["company"] or "").strip()
-            prompt = f"Write a short cold email to {company}"
-            result = call_llm(prompt=prompt, agent="echo", action="outreach_draft")
+            lead_name = str(lead["name"] or "").strip()
+            lead_company = str(lead["company"] or "").strip()
+            lead_notes = str(lead["notes"] or "").strip()
+            signature = (
+                "\n\nBest regards,\n"
+                "Navin Rana\n"
+                "AI Automation Engineer\n"
+                "FlowCraft Automations\n"
+                "theautomationguy.navin@gmail.com"
+            )
 
-            if isinstance(result, dict):
-                status = str(result.get("status") or "llm_error")
-                detail = str(result.get("detail") or result)
-                if status == "quota_blocked":
-                    conn.execute(
-                        "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
-                        (int(time.time()), "quota_blocked", run_id),
-                    )
-                    conn.commit()
-                    return result
-                log_error(conn, "echo", "draft_generation", "LOGIC_ERROR", detail, str(lead_id))
+            def _is_bad(text: str) -> bool:
+                t = text.lower()
+                if not text.startswith("Subject:"):
+                    return True
+                if "\n\n" not in text:
+                    return True
+                subject_block, body = text.split("\n\n", 1)
+                if "\n" in subject_block.strip():
+                    return True
+                body = body.strip()
+                if not body:
+                    return True
+                body_for_checks = body.split("\n\nBest regards,\n", 1)[0].strip()
+                body_sentences = len([s for s in re.split(r"[.!?]+", body_for_checks) if s.strip()])
+                cta_mentions = t.count("15-minute call") + t.count("15 minute call")
+                return (
+                    "[" in text or "]" in text or
+                    "<" in text or ">" in text or
+                    "your company" in t or
+                    "decision maker" in t or
+                    "please tell me" in t or
+                    "here are" in t or
+                    "here is a draft" in t or
+                    "option 1" in t or
+                    len(text.split()) > 120 or
+                    body_sentences < 3 or
+                    cta_mentions != 1 or
+                    not body_for_checks.endswith((".", "!", "?"))
+                )
+
+            def _with_signature(text: str) -> str:
+                base = str(text or "").strip()
+                if not base:
+                    return base
+                for marker in ("\n\nBest regards,\n", "\n\nBest,\n"):
+                    if marker in base:
+                        base = base.split(marker, 1)[0].rstrip()
+                        break
+                return f"{base}{signature}"
+
+            def _fallback_draft() -> str:
+                fallback_subject_target = lead_company or recipient
+                fallback_context = (lead_notes or "manual reporting and follow-ups").strip().rstrip(".")
+                return _with_signature(
+                    f"Subject: Streamlining {fallback_subject_target} workflows\n\n"
+                    f"Hi {recipient},\n\n"
+                    f"I noticed {fallback_subject_target} is still spending time on {fallback_context.lower()}. "
+                    f"I help teams automate reporting, follow-ups, and handoffs with n8n and Python agents. "
+                    f"Would you be open to a 15-minute call next week to see what this could look like for {fallback_subject_target}?"
+                )
+
+            if not lead_name and not lead_company:
+                log_error(conn, "echo", "outreach_draft", "MISSING_CONTEXT",
+                          "Lead missing name and company", str(lead_id))
                 errors += 1
                 conn.commit()
                 continue
 
-            raw = str(result or "").strip()
+            recipient = lead_name if lead_name else "team"
+            target = lead_company if lead_company else recipient
+            context_line = f"Context: {lead_notes}" if lead_notes else ""
+
+            prompt = f"""
+You are a senior B2B outbound strategist.
+
+Write a high-converting cold email.
+
+Context:
+Recipient: {recipient}
+Company: {target}
+{context_line}
+
+STRICT RULES:
+- Do NOT use placeholders (no [], no generic tags)
+- Do NOT ask for missing information
+- Make reasonable assumptions if data is missing
+- Max 80 words
+- Exactly 1 CTA (15-minute call)
+- No fluff phrases (no "hope this finds you well")
+
+OUTPUT FORMAT (STRICT):
+Subject: <one line>
+
+<body max 3-4 sentences>
+"""
+
+            attempt = 0
+            text = ""
+            llm_failed = False
+            llm_failure_detail = "LLM failed after retries"
+            result: str | dict = ""
+
+            while attempt < 2:
+                try:
+                    result = call_llm(prompt=prompt, agent="echo", action="outreach_draft")
+                except Exception as exc:
+                    llm_failed = True
+                    llm_failure_detail = str(exc)[:300]
+                    attempt += 1
+                    continue
+
+                if isinstance(result, dict):
+                    llm_failed = True
+                    llm_failure_detail = str(result.get("detail") or result)
+                    attempt += 1
+                    continue
+
+                text = _with_signature(str(result or "").strip())
+
+                if not _is_bad(text):
+                    break
+
+                llm_failed = True
+                attempt += 1
+
+            if _is_bad(text):
+                log_error(
+                    conn,
+                    "echo",
+                    "outreach_draft",
+                    "LLM_FAILURE",
+                    llm_failure_detail,
+                    str(lead_id),
+                )
+                text = _fallback_draft()
+                log_error(
+                    conn,
+                    "echo",
+                    "outreach_draft",
+                    "FALLBACK_USED",
+                    "Fallback draft inserted",
+                    str(lead_id),
+                )
+                errors += 1
+            elif llm_failed:
+                log_error(
+                    conn,
+                    "echo",
+                    "outreach_draft",
+                    "LLM_FAILURE",
+                    llm_failure_detail,
+                    str(lead_id),
+                )
+
+            if _is_bad(text):
+                log_error(conn, "echo", "outreach_draft", "LOGIC_ERROR",
+                          "Fallback draft validation failed", str(lead_id))
+                errors += 1
+                conn.commit()
+                continue
+
             conn.execute(
                 """
                 INSERT INTO outreach_drafts (lead_id, draft_text, status, created_at)
                 VALUES (?, ?, 'pending', datetime('now', '+5 hours', '+30 minutes'))
                 """,
-                (lead_id, raw[:1000]),
+                (lead_id, text[:1000]),
             )
             log_agent(conn, "echo", "draft_created", f"lead_id={lead_id}", "ok")
             drafted += 1
@@ -3318,6 +3615,14 @@ async def send_outreach_email(
             if not body:
                 return {"status": "error", "error": "empty_draft",
                         "detail": f"draft_id {draft_id} has empty draft_text"}
+            if body.lower().startswith("subject:"):
+                body_lines = body.splitlines()
+                parsed_subject = body_lines[0][len("Subject:"):].strip()
+                parsed_body = "\n".join(body_lines[1:]).strip()
+                if parsed_subject:
+                    subject = parsed_subject
+                if parsed_body:
+                    body = parsed_body
 
         lead = conn.execute(
             "SELECT email, status, email_status FROM leads WHERE id=?",
@@ -3605,6 +3910,13 @@ async def list_due_followups(limit: int = 10) -> str:
                 AND lower(COALESCE(es.status,'')) IN ('inbound','reply_received','replied')
                 AND date(COALESCE(es.sent_at, es.created_at)) >= date('now', '+5 hours', '+30 minutes', '-3 day')
           )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM email_send_log es
+              WHERE es.lead_id=leads.id
+                AND lower(es.status)='reply_received'
+                AND es.sent_at >= datetime('now','+5 hours','+30 minutes','-3 day')
+          )
         ORDER BY date(COALESCE(follow_up_due_at, created_at)) ASC, id ASC
         LIMIT ?
         """,
@@ -3706,7 +4018,16 @@ async def send_follow_up(lead_id: int, approved: bool = False) -> str:
         """,
         (lead_id,),
     ).fetchone()
-    if int(inbound_recent[0] or 0) > 0:
+    reply_received_recent = conn.execute(
+        """
+        SELECT COUNT(*) FROM email_send_log
+        WHERE lead_id=?
+          AND lower(status)='reply_received'
+          AND sent_at >= datetime('now','+5 hours','+30 minutes','-3 day')
+        """,
+        (lead_id,),
+    ).fetchone()
+    if int(inbound_recent[0] or 0) > 0 or int(reply_received_recent[0] or 0) > 0:
         log_error(conn, "echo", "follow_up", "LOGIC_ERROR", "Recent inbound reply found", str(lead_id))
         conn.commit()
         conn.close()

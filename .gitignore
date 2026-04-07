@@ -19,6 +19,11 @@ secrets/
 *.secret
 
 # Database files
+database/
+database/saturn.db
+*.db
+*.db-wal
+*.db-shm
 database/*.db
 database/*.db-wal
 database/*.db-shm

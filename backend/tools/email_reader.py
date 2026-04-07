@@ -193,17 +193,19 @@ def read_replies(max_emails: int = 20) -> list[dict]:
                 ).fetchone()
                 if row:
                     lead_id = int(row[0])
+                else:
+                    log_error(conn, "read_replies", "LOGIC_ERROR", "unlinked reply sender", sender_email)
 
             classification = classify_reply(subject, body)
             if lead_id is not None:
                 reply_now = _ist_now().replace(microsecond=0).isoformat()
                 reply_logged = conn.execute(
                     """
-                    SELECT 1
+                    SELECT id
                     FROM email_send_log
                     WHERE lead_id=?
-                      AND lower(status)='reply_received'
-                      AND date(sent_at)=date('now', '+5 hours', '+30 minutes')
+                      AND status='reply_received'
+                      AND sent_at >= datetime('now','+5 hours','+30 minutes','-1 day')
                     LIMIT 1
                     """,
                     (lead_id,),
@@ -211,8 +213,8 @@ def read_replies(max_emails: int = 20) -> list[dict]:
                 if not reply_logged:
                     conn.execute(
                         """
-                        INSERT INTO email_send_log (lead_id, draft_id, status, sent_at)
-                        VALUES (?, NULL, 'reply_received', ?)
+                        INSERT INTO email_send_log (lead_id, draft_id, status, attempt_count, error_category, sent_at)
+                        VALUES (?, NULL, 'reply_received', 1, NULL, ?)
                         """,
                         (lead_id, reply_now),
                     )
