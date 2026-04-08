@@ -2,6 +2,7 @@
 __pycache__/
 pycache/
 *.py[cod]
+*.pyc
 *.pyo
 *.pyd
 .Python
@@ -36,6 +37,10 @@ logs/
 *.tmp
 *.bak
 *.pid
+
+# Proof artifacts are documentation, not runtime output
+!docs/proof/
+!docs/proof/**
 
 # Node / UI
 ui/node_modules/

@@ -36,7 +36,8 @@ try:
     if result is None and isinstance(parsed.get("result"), str):
         try:
             result = json.loads(parsed["result"])
-        except Exception:
+        except Exception as exc:
+            log_message(f"JSON parse failure for nested result: {exc}")
             result = {"status": "unknown", "raw": parsed.get("result")}
     status = (result or {}).get("status", "unknown")
     if status == "success":

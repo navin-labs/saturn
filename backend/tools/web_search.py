@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
 import sqlite3
-from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
 
-DB_PATH = Path("/home/navin/Workspace/Saturn/database/saturn.db")
+from backend.path_guard import enforce_write_path
+from configs.paths import DB_PATH
+
+logger = logging.getLogger("saturn.web_search")
 ERROR_TYPES = {"API_ERROR", "AUTH_ERROR", "RATE_LIMIT", "NETWORK_ERROR", "DB_ERROR", "LOGIC_ERROR"}
 
 
@@ -18,7 +21,9 @@ def utc_now() -> str:
 
 
 def db_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    db_path = enforce_write_path(DB_PATH, "web-search-db")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
@@ -71,6 +76,7 @@ def ensure_service_counter(conn: sqlite3.Connection, service: str, provider: str
         SELECT id, COALESCE(paused,0) AS paused, COALESCE(call_count,0) AS call_count
         FROM api_usage_log
         WHERE service=? AND usage_date=? AND endpoint='daily_counter'
+        ORDER BY id DESC
         LIMIT 1
         """,
         (service, today),
@@ -87,7 +93,8 @@ def row_get(row: sqlite3.Row | tuple, key: str, index: int, default: int = 0) ->
         if isinstance(row, sqlite3.Row):
             return int(row[key] or default)
         return int(row[index] or default)
-    except Exception:
+    except Exception as exc:
+        logger.warning("web_search row_get failed", exc_info=exc)
         return default
 
 
@@ -187,8 +194,8 @@ def search(query: str, max_results: int = 10, conn: sqlite3.Connection | None = 
         try:
             log_error(conn, "Hunter", "web_search", "DB_ERROR", "database write failure", str(exc))
             conn.commit()
-        except sqlite3.Error:
-            pass
+        except sqlite3.Error as log_exc:
+            logger.warning("web_search DB error logging failed", exc_info=log_exc)
         return []
     finally:
         if own_conn:

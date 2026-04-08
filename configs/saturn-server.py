@@ -2,6 +2,7 @@ import asyncio
 import base64 as _base64
 import datetime
 import json
+import logging
 import os
 import queue
 import re
@@ -27,6 +28,8 @@ _SATURN_ROOT = str(_pathlib.Path(__file__).resolve().parent.parent)
 if _SATURN_ROOT not in _sys.path:
     _sys.path.insert(0, _SATURN_ROOT)
 
+logger = logging.getLogger("saturn.server")
+
 _LLM_QUEUE = queue.Queue()
 _WORKER_STARTED = False
 _BUCKET_TOKENS = 5
@@ -40,22 +43,21 @@ try:
     from backend.tools.email_sender import send_email as email_send_tool
     TOOLS_AVAILABLE = True
 except ImportError as e:
-    import sys as _sys2
-    print(f"TOOLS_IMPORT_ERROR: {e}", file=_sys2.stderr)
+    logger.warning("TOOLS_IMPORT_ERROR: %s", e)
     TOOLS_AVAILABLE = False
 
 try:
     from backend.tools.linkedin_search import search_prospects as _linkedin_search
     _linkedin_available = True
-except Exception:
+except Exception as exc:
+    logger.warning("[Saturn] LinkedIn search unavailable: %s", exc)
     _linkedin_available = False
 
 try:
     from backend.tools.notion_sync import NotionSync, NotionAPIError, get_sync
     _notion = get_sync()
-except Exception as _ne:
-    import logging
-    logging.warning(f"[Saturn] Notion sync unavailable: {_ne}")
+except Exception as exc:
+    logger.warning("[Saturn] Notion sync unavailable: %s", exc)
     _notion = None
 
 try:
@@ -69,7 +71,8 @@ try:
         n8n_build_simple as _n8n_build,
     )
     _n8n_ok = True
-except Exception:
+except Exception as exc:
+    logger.warning("[Saturn] n8n skill unavailable: %s", exc)
     _n8n_ok = False
 
 try:
@@ -80,7 +83,8 @@ try:
         validate as _ew_validate,
     )
     _email_writer_ok = True
-except Exception:
+except Exception as exc:
+    logger.warning("[Saturn] email writer skill unavailable: %s", exc)
     _email_writer_ok = False
 
 try:
@@ -90,7 +94,8 @@ try:
         restart_api as _sh_restart,
     )
     _self_heal_ok = True
-except Exception:
+except Exception as exc:
+    logger.warning("[Saturn] self-heal skill unavailable: %s", exc)
     _self_heal_ok = False
 
 try:
@@ -101,7 +106,8 @@ try:
         parse_score as _li_parse,
     )
     _linkedin_ok = True
-except Exception:
+except Exception as exc:
+    logger.warning("[Saturn] LinkedIn skill unavailable: %s", exc)
     _linkedin_ok = False
 
 try:
@@ -110,7 +116,8 @@ try:
         monthly_usage as _cm_monthly,
     )
     _cost_monitor_ok = True
-except Exception:
+except Exception as exc:
+    logger.warning("[Saturn] cost monitor skill unavailable: %s", exc)
     _cost_monitor_ok = False
 
 # Self-contained BASE_PATH + write guard for runtime deployment.
@@ -128,7 +135,8 @@ def read_skill(skill_name: str) -> str:
     path = SKILLS_DIR / skill_name / 'SKILL.md'
     try:
         return path.read_text() if path.exists() else ''
-    except Exception:
+    except Exception as exc:
+        logger.warning("[Saturn] failed reading skill %s: %s", skill_name, exc)
         return ''
 
 
@@ -182,13 +190,16 @@ ERROR_TYPES = {
     "LOGIC_ERROR",
     "LLM_FAILURE",
     "FALLBACK_USED",
+    "SMTP_FAILURE",
+    "SMTP_NOT_CONFIGURED",
 }
+RATE_LIMIT_MESSAGE = "Rate limit reached. Try again in a few minutes."
+RATE_LIMIT_USER_MESSAGE = "⚠️ Rate limit reached. System is safe. Retry in a few minutes."
+RATE_LIMIT_RETRY_AFTER = 60
 STATUS_TRANSITIONS = {
     "new": {"contacted"},
-    "contacted": {"qualified"},
-    "qualified": {"proposal"},
-    "proposal": {"won", "lost"},
-    "won": set(),
+    "contacted": {"qualified", "lost"},
+    "qualified": set(),
     "lost": set(),
 }
 MAX_DAILY_LEADS = 10
@@ -224,8 +235,8 @@ try:
     set_fallback_models(_LLM_FALLBACK_MODELS)
     _interval = float(os.environ.get("SATURN_LLM_INTERVAL", "1.5"))
     set_min_interval(_interval)
-except Exception:
-    pass  # fail-open: call_llm still works via direct fallback
+except Exception as exc:
+    logger.warning("[Saturn] LLM queue bootstrap failed; continuing without shared queue setup: %s", exc, exc_info=True)
 
 _AGENT_SYSTEM_PROMPTS = {
     "saturn": "You are Saturn, an AI operations orchestrator managing an automation agency.",
@@ -242,8 +253,8 @@ def _response_text_or_empty(response: object) -> str:
         text = getattr(response, "text", "")
         if text:
             return str(text).strip()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("[Saturn] response.text access failed: %s", exc)
     candidates = getattr(response, "candidates", None) or []
     for candidate in candidates:
         content = getattr(candidate, "content", None)
@@ -311,6 +322,16 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = 1000,
         from backend.modules.llm_queue import call_llm_queued
         return call_llm_queued(prompt, system=system, max_tokens=max_tokens, agent=agent, action=action)
     except Exception as e:
+        text = str(e).lower()
+        if "rate limit" in text or "429" in text or "quota" in text or "too many requests" in text:
+            logger.warning("[Saturn:%s] rate limited during LLM call: %s", agent, e)
+            return {
+                "status": "rate_limited",
+                "message": RATE_LIMIT_MESSAGE,
+                "retry_after": RATE_LIMIT_RETRY_AFTER,
+                "service": "llm",
+                "agent": agent,
+            }
         raise RuntimeError(f"[Saturn:{agent}] LLM call failed: {e}") from e
 
 
@@ -491,6 +512,32 @@ def ensure_operational_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "email_send_log", "attempt_count INTEGER DEFAULT 1")
     add_column_if_missing(conn, "email_send_log", "error_category TEXT")
     add_column_if_missing(conn, "email_send_log", "sent_at TIMESTAMP")
+    conn.execute("UPDATE outreach_drafts SET status=lower(COALESCE(status,'')) WHERE status IS NOT NULL")
+    conn.execute("UPDATE email_send_log SET status=lower(COALESCE(status,'')) WHERE status IS NOT NULL")
+    conn.execute(
+        """
+        DELETE FROM outreach_drafts
+        WHERE lower(COALESCE(status,'')) IN ('pending','approved')
+          AND id NOT IN (
+              SELECT MAX(id)
+              FROM outreach_drafts
+              WHERE lower(COALESCE(status,'')) IN ('pending','approved')
+              GROUP BY lead_id
+          )
+        """
+    )
+    conn.execute(
+        """
+        DELETE FROM email_send_log
+        WHERE draft_id IS NOT NULL
+          AND id NOT IN (
+              SELECT MAX(id)
+              FROM email_send_log
+              WHERE draft_id IS NOT NULL
+              GROUP BY draft_id, status
+          )
+        """
+    )
 
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_leads_website_norm ON leads(website_norm) WHERE website_norm IS NOT NULL"
@@ -501,7 +548,15 @@ def ensure_operational_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_content_queue_status ON content_queue(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_content_queue_lead ON content_queue(lead_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_outreach_drafts_lead ON outreach_drafts(lead_id)")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_outreach_drafts_active_lead "
+        "ON outreach_drafts(lead_id) WHERE lower(COALESCE(status,'')) IN ('pending','approved')"
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_email_send_log_day ON email_send_log(status, sent_at)")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_email_send_log_draft_status "
+        "ON email_send_log(draft_id, status) WHERE draft_id IS NOT NULL"
+    )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_api_usage_day ON api_usage_log(agent, provider, called_at)"
     )
@@ -549,8 +604,8 @@ def run_async_tool(coro) -> None:
         loop.create_task(coro)
     except RuntimeError:
         asyncio.run(coro)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("[Saturn] async tool execution failed: %s", exc, exc_info=True)
 
 
 def normalize_website(website: str | None) -> str | None:
@@ -672,14 +727,150 @@ def resolve_hunter_email(
     return None, "not_found", "none"
 
 
+EMAIL_SIGNATURE = "\n".join(
+    [
+        "Best regards,",
+        "Navin Rana",
+        "AI Automation Engineer",
+        "FlowCraft Automations",
+        "theautomationguy.navin@gmail.com",
+    ]
+)
+MIN_EMAIL_BODY_WORDS = 5
+EMAIL_BODY_MIN_WORDS = 80
+EMAIL_BODY_MAX_WORDS = 120
+DISALLOWED_EMAIL_PHRASES = (
+    "hope you're doing well",
+    "i hope you're doing well",
+    "quick thought",
+    "just checking",
+    "i came across",
+    "we specialize",
+    "your company",
+    "your name",
+    "company name",
+    "decision maker",
+)
+_EMAIL_SUBJECT_LINE_RE = re.compile(r"(?im)^subject:\s*")
+
+
+def build_echo_subject(lead_name: str = "", lead_company: str = "") -> str:
+    company = str(lead_company or "").strip()
+    first_name = (str(lead_name or "").strip().split(" ")[0] or "").strip()
+    target = company or first_name or "your team"
+    return f"Automation idea for {target}"
+
+
+def _sanitize_email_subject(subject: str, default_subject: str = "") -> str:
+    raw = str(subject or "").replace("\r", "\n")
+    first_line = raw.split("\n", 1)[0].strip()
+    if first_line.startswith("__SUBJECT__:"):
+        first_line = first_line.replace("__SUBJECT__:", "", 1).strip()
+    elif first_line.lower().startswith("subject:"):
+        first_line = first_line[len("subject:"):].strip()
+    cleaned = re.sub(r"\s+", " ", first_line).strip()
+    fallback = re.sub(r"\s+", " ", str(default_subject or "")).strip()
+    return cleaned or fallback
+
+
+def strip_email_signature(body_text: str) -> str:
+    body = str(body_text or "").strip()
+    for marker in ("\n\nBest regards,\n", "\n\nBest,\n", "\n\nRegards,\n"):
+        if marker in body:
+            return body.split(marker, 1)[0].rstrip()
+    return body
+
+
+def ensure_email_signature(body_text: str, signature: str = EMAIL_SIGNATURE) -> str:
+    base = strip_email_signature(body_text)
+    if not base:
+        return ""
+    return f"{base}\n\n{signature}".strip()
+
+
+def _email_word_count(body_text: str) -> int:
+    body = strip_email_signature(str(body_text or "")).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not body:
+        return 0
+    return len(re.sub(r"\s+", " ", body).split())
+
+
+def _email_body_error(body_text: str, subject_text: str = "") -> str:
+    body = strip_email_signature(str(body_text or "")).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not body:
+        return "body_missing"
+    lower_body = body.lower()
+    if any(token in lower_body for token in ("[", "]", "<", ">", "your company", "your name", "company name", "decision maker")):
+        return "placeholder_content"
+    if any(phrase in lower_body for phrase in DISALLOWED_EMAIL_PHRASES):
+        return "generic_phrase"
+    subject = _sanitize_email_subject(subject_text).lower()
+    if subject and subject in lower_body:
+        return "body_repeats_subject"
+    paragraphs = [block.strip() for block in body.split("\n\n") if block.strip()]
+    if len(paragraphs) != 4:
+        return "paragraph_count_invalid"
+    if not paragraphs[0].startswith("Hi "):
+        return "greeting_missing"
+    if any(len(paragraph.split()) < 5 for paragraph in paragraphs[1:]):
+        return "paragraph_too_short"
+    word_count = _email_word_count(body)
+    if word_count < EMAIL_BODY_MIN_WORDS or word_count > EMAIL_BODY_MAX_WORDS:
+        return "word_count_invalid"
+    return ""
+
+
+def compose_email_draft(subject_text: str, body_text: str, default_subject: str = "") -> str:
+    subject = _sanitize_email_subject(subject_text, default_subject)
+    body = ensure_email_signature(body_text)
+    if not subject or not body or _email_body_error(body, subject):
+        return ""
+    return f"__SUBJECT__:{subject}\n\n{body}".strip()
+
+
+def parse_email_draft_text(draft_text: str, default_subject: str = "") -> tuple[str, str, str]:
+    raw = str(draft_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return "", "", "empty_draft"
+
+    subject = _sanitize_email_subject(default_subject)
+    body = raw
+    if raw.startswith("__SUBJECT__:"):
+        first_line, _, remainder = raw.partition("\n")
+        subject = _sanitize_email_subject(first_line, default_subject)
+        body = remainder.strip()
+    elif raw.lower().startswith("subject:"):
+        lines = raw.splitlines()
+        subject = _sanitize_email_subject(lines[0], default_subject)
+        body = "\n".join(lines[1:]).strip()
+
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    body = strip_email_signature(body)
+    if "__SUBJECT__" in body or _EMAIL_SUBJECT_LINE_RE.search(body):
+        return "", "", "body_contains_subject_marker"
+    if not subject:
+        return "", "", "subject_missing"
+    if not body:
+        return "", "", "body_missing"
+    if len(body.split()) < MIN_EMAIL_BODY_WORDS:
+        return "", "", "body_too_short"
+    structured_body = ensure_email_signature(body)
+    body_error = _email_body_error(structured_body, subject)
+    if body_error:
+        return "", "", body_error
+    return subject, structured_body, ""
+
+
 def build_echo_draft_text(lead_name: str, lead_company: str) -> str:
     first_name = (str(lead_name or "").strip().split(" ")[0] or "there")
-    company = str(lead_company or "").strip()
-    return (
-        f"Hi {first_name}, I saw you work with {company} and thought I'd reach out. "
-        f"Companies in your space often face challenges with manual processes. "
-        f"I build automations to solve exactly that, saving valuable time."
-    )
+    company = str(lead_company or "").strip() or "your team"
+    return f"""Hi {first_name},
+
+I noticed {company} is likely feeling friction around approvals, status updates, and follow-through once several requests are moving at the same time, which usually slows delivery before the actual work becomes the problem.
+
+I build lightweight Python, n8n, and Notion workflows that route tasks automatically, trigger the next step on time, and keep everyone working from the same live status instead of chasing updates across inboxes and side conversations.
+
+Would you be open to a quick 15-minute call next week to see whether that would reduce operational drag for {company} without changing how the team already delivers the work?"""
 
 
 def log_error(
@@ -714,6 +905,44 @@ def log_agent(
     )
 
 
+def delete_active_drafts_for_lead(conn: sqlite3.Connection, lead_id: int) -> int:
+    return (
+        conn.execute(
+            """
+            DELETE FROM outreach_drafts
+            WHERE lead_id=?
+              AND lower(COALESCE(status,'')) IN ('pending','approved')
+            """,
+            (lead_id,),
+        ).rowcount
+        or 0
+    )
+
+
+def _missing_smtp_config_fields() -> list[str]:
+    required = ("SMTP_HOST", "SMTP_USER", "SMTP_PASS")
+    return [key for key in required if not (os.environ.get(key, "") or "").strip()]
+
+
+def _log_notion_fail_open(
+    conn: sqlite3.Connection | None,
+    agent: str,
+    action: str,
+    exc: Exception,
+    detail: str = "",
+) -> None:
+    message = "Notion sync failed in fail-open path"
+    full_detail = f"{detail} | {str(exc)[:400]}" if detail else str(exc)[:400]
+    if conn is not None:
+        try:
+            log_error(conn, agent, action, "API_ERROR", message, full_detail)
+            conn.commit()
+            return
+        except sqlite3.Error as log_exc:
+            logger.warning("[Saturn] Notion fail-open DB log failed: %s", log_exc)
+    logger.warning("[Saturn] %s agent=%s detail=%s", message, agent, full_detail)
+
+
 def _sentinel_log_check(conn, check_name: str, status: str, message: str) -> None:
     """Write one sentinel check result to system_alerts. Skip if identical record exists today."""
     existing = conn.execute(
@@ -721,6 +950,7 @@ def _sentinel_log_check(conn, check_name: str, status: str, message: str) -> Non
            WHERE agent='sentinel' AND title=?
            AND date(created_at)=date('now', '+5 hours', '+30 minutes')
            AND resolved=0
+           ORDER BY id DESC
            LIMIT 1""",
         (check_name,)
     ).fetchone()
@@ -747,40 +977,55 @@ def log_api_call(
     safe_service = (provider or agent or "unknown").strip().lower()
     quota_limit = service_quota_limit(safe_service)
     now = utc_now()
+    usage_date = datetime.datetime.now(
+        tz=datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    ).date().isoformat()
+    ensure_service_daily_counter_row(conn, safe_service)
     conn.execute(
         """
-        INSERT INTO api_usage_log
-        (agent, provider, endpoint, status, error_type, detail, called_at, service, usage_date, call_date, call_count, quota_limit, paused)
-        VALUES ('system', ?, 'daily_counter', 'success', '', '', ?, ?, DATE('now','localtime'), DATE('now','localtime'), 1, ?, 0)
-        ON CONFLICT(service, usage_date, endpoint) DO UPDATE SET
-            call_count=COALESCE(api_usage_log.call_count,0)+1,
-            called_at=excluded.called_at,
-            call_date=excluded.call_date,
-            status=excluded.status,
-            error_type=excluded.error_type,
-            detail=excluded.detail,
+        UPDATE api_usage_log
+        SET call_count=COALESCE(call_count,0)+1,
+            called_at=?,
+            call_date=?,
+            status='success',
+            error_type='',
+            detail='',
             quota_limit=CASE
-                WHEN COALESCE(api_usage_log.quota_limit,0) > 0 THEN api_usage_log.quota_limit
-                ELSE excluded.quota_limit
+                WHEN COALESCE(quota_limit,0) > 0 THEN quota_limit
+                ELSE ?
             END
+        WHERE service=? AND usage_date=? AND endpoint='daily_counter'
         """,
-        (safe_service, now, safe_service, quota_limit),
+        (now, usage_date, quota_limit, safe_service, usage_date),
     )
-    conn.execute(
+    existing = conn.execute(
         """
-        INSERT INTO api_usage_log
-        (agent, provider, endpoint, status, error_type, detail, called_at, service, usage_date, call_date, call_count, quota_limit, paused)
-        VALUES (?,?,?,?,?,?,?, ?, DATE('now','localtime'), DATE('now','localtime'), 1, ?, 0)
-        ON CONFLICT(service, usage_date, endpoint) DO UPDATE SET
-            call_count=COALESCE(api_usage_log.call_count,0)+1,
-            called_at=excluded.called_at,
-            call_date=excluded.call_date,
-            status=excluded.status,
-            error_type=excluded.error_type,
-            detail=excluded.detail
+        SELECT id, call_count
+        FROM api_usage_log
+        WHERE service=? AND usage_date=? AND COALESCE(endpoint,'')=COALESCE(?, '')
+        ORDER BY id DESC
+        LIMIT 1
         """,
-        (agent, provider, endpoint, status, error_type, detail, now, safe_service, quota_limit),
-    )
+        (safe_service, usage_date, endpoint),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            """
+            UPDATE api_usage_log
+            SET agent=?, provider=?, status=?, error_type=?, detail=?, called_at=?, call_date=?, call_count=COALESCE(call_count,0)+1, quota_limit=?
+            WHERE id=?
+            """,
+            (agent, provider, status, error_type, detail, now, usage_date, quota_limit, int(existing[0])),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO api_usage_log
+            (agent, provider, endpoint, status, error_type, detail, called_at, service, usage_date, call_date, call_count, quota_limit, paused)
+            VALUES (?,?,?,?,?,?,?, ?, ?, ?, 1, ?, 0)
+            """,
+            (agent, provider, endpoint, status, error_type, detail, now, safe_service, usage_date, usage_date, quota_limit),
+        )
 
 
 def telegram_env() -> dict[str, str]:
@@ -791,7 +1036,8 @@ def telegram_env() -> dict[str, str]:
                 if "=" in line:
                     key, value = line.strip().split("=", 1)
                     env_vars[key] = value
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
+        logger.warning("[Saturn] Telegram env file missing: %s", exc)
         return {}
     return env_vars
 
@@ -841,7 +1087,8 @@ def _sarvam_tts(text: str) -> str:
             fh.write(audio_bytes)
             tmp_path = fh.name
         return tmp_path
-    except Exception:
+    except Exception as exc:
+        logger.warning("[Saturn] Sarvam TTS failed: %s", exc)
         return ""
 
 
@@ -907,11 +1154,12 @@ def _system_tts(text: str) -> str:
         if ffmpeg_result.returncode == 0:
             try:
                 os.unlink(raw_path)
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("[Saturn] voice alert temp cleanup failed: %s", exc)
             return soft_path
         return raw_path
-    except Exception:
+    except Exception as exc:
+        logger.warning("[Saturn] system TTS failed: %s", exc)
         return ""
 
 
@@ -954,7 +1202,8 @@ def _send_telegram_voice_note(audio_file: str) -> bool:
             timeout=30,
         )
         return result.returncode == 0 and '"ok":true' in (result.stdout or "")
-    except Exception:
+    except Exception as exc:
+        logger.warning("[Saturn] Telegram voice note send failed: %s", exc)
         return False
 
 
@@ -991,6 +1240,7 @@ def send_telegram_message(message: str, thread_key: str = "THREAD_ALERTS", alert
                 """
                 SELECT id FROM system_alerts
                 WHERE alert_type=? AND date(created_at)=date('now', '+5 hours', '+30 minutes')
+                ORDER BY id DESC
                 LIMIT 1
                 """,
                 (safe_alert_type,),
@@ -1079,8 +1329,8 @@ def create_system_alert_once(
             "created_at": utc_now().isoformat(),
         }
         run_async_tool(notion_sync_alert(json.dumps(alert_dict)))
-    except Exception:
-        pass
+    except Exception as notion_exc:
+        _log_notion_fail_open(conn, "sentinel", "create_system_alert_notion_sync", notion_exc, title)
     return True
 
 
@@ -1101,33 +1351,62 @@ def ensure_service_daily_counter_row(conn: sqlite3.Connection, service: str) -> 
         return
     now = utc_now()
     quota_limit = service_quota_limit(service_lc)
+    usage_date = datetime.datetime.now(
+        tz=datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    ).date().isoformat()
+    existing = conn.execute(
+        """
+        SELECT id
+        FROM api_usage_log
+        WHERE service=? AND usage_date=? AND endpoint='daily_counter'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (service_lc, usage_date),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            """
+            UPDATE api_usage_log
+            SET called_at=?,
+                call_date=?,
+                status='success',
+                error_type='',
+                detail='',
+                quota_limit=CASE
+                    WHEN COALESCE(quota_limit,0) > 0 THEN quota_limit
+                    ELSE ?
+                END
+            WHERE id=?
+            """,
+            (now, usage_date, quota_limit, int(existing[0])),
+        )
+        return
     conn.execute(
         """
         INSERT INTO api_usage_log
         (agent, provider, endpoint, status, error_type, detail, called_at, service, usage_date, call_date, call_count, quota_limit, paused)
-        VALUES ('system', ?, 'daily_counter', 'success', '', '', ?, ?, DATE('now','localtime'), DATE('now','localtime'), 0, ?, 0)
-        ON CONFLICT(service, usage_date, endpoint) DO UPDATE SET
-            called_at=excluded.called_at,
-            call_date=excluded.call_date,
-            status=excluded.status,
-            error_type=excluded.error_type,
-            detail=excluded.detail,
-            quota_limit=CASE
-                WHEN COALESCE(api_usage_log.quota_limit,0) > 0 THEN api_usage_log.quota_limit
-                ELSE excluded.quota_limit
-            END
+        VALUES ('system', ?, 'daily_counter', 'success', '', '', ?, ?, ?, ?, 0, ?, 0)
         """,
-        (service_lc, now, service_lc, quota_limit),
+        (service_lc, now, service_lc, usage_date, usage_date, quota_limit),
     )
-    if quota_limit > 0:
-        conn.execute(
-            """
-            UPDATE api_usage_log
-            SET quota_limit=?
-            WHERE service=? AND call_date=date('now', '+5 hours', '+30 minutes') AND endpoint='daily_counter' AND (quota_limit IS NULL OR quota_limit<=0)
-            """,
-            (quota_limit, service_lc),
-        )
+
+
+def _safe_increment_service_daily_usage(conn: sqlite3.Connection, service: str) -> None:
+    try:
+        increment_service_daily_usage(conn, service)
+    except sqlite3.Error as exc:
+        try:
+            log_error(
+                conn,
+                "saturn",
+                "service_usage",
+                "DB_ERROR",
+                "Service usage increment failed",
+                f"{service}: {str(exc)[:300]}",
+            )
+        except sqlite3.Error:
+            logger.warning("[Saturn] service usage increment logging failed for %s", service, exc_info=True)
 
 
 def service_is_paused(conn: sqlite3.Connection, service: str) -> bool:
@@ -1138,6 +1417,7 @@ def service_is_paused(conn: sqlite3.Connection, service: str) -> bool:
         SELECT COALESCE(paused,0)
         FROM api_usage_log
         WHERE service=? AND call_date=date('now', '+5 hours', '+30 minutes') AND endpoint='daily_counter'
+        ORDER BY id DESC
         LIMIT 1
         """,
         (service_lc,),
@@ -1152,6 +1432,7 @@ def hunter_api_calls_today(conn: sqlite3.Connection, provider: str = "serpapi") 
         SELECT call_count
         FROM api_usage_log
         WHERE lower(service)='hunter' AND call_date=date('now', '+5 hours', '+30 minutes') AND endpoint='daily_counter'
+        ORDER BY id DESC
         LIMIT 1
         """
     ).fetchone()
@@ -1209,10 +1490,8 @@ def validate_lead_transition(
         return False, "contacted_to_lost_requires_followup_count_2"
     allowed = {
         "new": {"contacted"},
-        "contacted": {"qualified"},
-        "qualified": {"proposal"},
-        "proposal": {"won", "lost"},
-        "won": set(),
+        "contacted": {"qualified", "lost"},
+        "qualified": set(),
         "lost": set(),
     }
     if requested_status in allowed.get(current_status, set()):
@@ -1253,8 +1532,8 @@ def add_task(title: str, priority: str = "normal") -> str:
                     "status": "Todo",
                     "agent": "Saturn",
                 })
-            except Exception as _e:
-                pass
+            except Exception as notion_exc:
+                _log_notion_fail_open(conn, "saturn", "add_task_notion_sync", notion_exc, title)
         return f"Task added: [{priority}] {title}"
     finally:
         conn.close()
@@ -1297,8 +1576,8 @@ def complete_task(task_id: int) -> str:
                     "updated_at": task["updated_at"],
                 }
                 run_async_tool(notion_create_task(json.dumps(task_dict)))
-        except Exception:
-            pass
+        except Exception as notion_exc:
+            _log_notion_fail_open(conn, "saturn", "complete_task_notion_sync", notion_exc, f"task_id={task_id}")
         return f"Task {task_id} marked complete."
     finally:
         conn.close()
@@ -1328,7 +1607,7 @@ def daily_report() -> str:
     try:
         _conn_guard.execute("BEGIN IMMEDIATE")
         _existing = _conn_guard.execute(
-            "SELECT id FROM agent_log WHERE action=? AND detail=? LIMIT 1",
+            "SELECT id FROM agent_log WHERE action=? AND detail=? ORDER BY id DESC LIMIT 1",
             ("daily_report_guard", _today_str),
         ).fetchone()
         if _existing:
@@ -1343,11 +1622,23 @@ def daily_report() -> str:
             ("Pulse", "daily_report_guard", _today_str, "running", utc_now()),
         )
         _conn_guard.commit()
-    except Exception:
+    except Exception as exc:
         try:
             _conn_guard.rollback()
-        except Exception:
-            pass
+        except Exception as rollback_exc:
+            logger.warning("[Saturn] daily_report guard rollback failed: %s", rollback_exc)
+        try:
+            log_error(
+                _conn_guard,
+                "pulse",
+                "daily_report_guard",
+                "DB_ERROR",
+                "Daily report guard failed",
+                str(exc)[:500],
+            )
+            _conn_guard.commit()
+        except Exception as log_exc:
+            logger.warning("[Saturn] daily_report guard error logging failed: %s", log_exc)
     finally:
         _conn_guard.close()
 
@@ -1372,8 +1663,8 @@ def daily_report() -> str:
                     pending_approvals=report.get("outreach", {}).get("pending_approval", 0),
                 )
                 telegram_report = _notion.format_progress_report(report)
-            except Exception as _e:
-                pass
+            except Exception as notion_exc:
+                _log_notion_fail_open(conn, "pulse", "daily_report_notion_sync", notion_exc, today)
         return r
     finally:
         conn.close()
@@ -1437,8 +1728,9 @@ def forge_run_workflow(workflow_id: str, payload: str = "{}") -> dict:
         return {"status": "error", "reason": "n8n skill not loaded"}
     try:
         data = json.loads(payload)
-    except Exception:
-        data = {}
+    except Exception as exc:
+        logger.warning("[Saturn] forge_run_workflow invalid payload: %s", exc)
+        return {"status": "error", "reason": "invalid JSON payload", "detail": str(exc)[:300]}
     return _n8n_run(workflow_id, data)
 
 
@@ -1449,8 +1741,9 @@ def forge_deploy_workflow(workflow_json: str, activate: bool = False) -> dict:
         return {"status": "error", "reason": "n8n skill not loaded"}
     try:
         wf = json.loads(workflow_json)
-    except Exception as e:
-        return {"status": "error", "reason": f"invalid JSON: {e}"}
+    except Exception as exc:
+        logger.warning("[Saturn] forge_deploy_workflow invalid payload: %s", exc)
+        return {"status": "error", "reason": "invalid JSON payload", "detail": str(exc)[:300]}
     return _n8n_deploy(wf, activate)
 
 
@@ -1564,8 +1857,9 @@ Only the email.
             raise ValueError("email too short")
         v = _ew_validate(body)
         return {"status": "success", "subject": subject, "body": body, "validation": v}
-    except Exception as e:
-        return {"status": "error", "reason": str(e)}
+    except Exception as exc:
+        logger.warning("[Saturn] echo_write_outreach failed", exc_info=exc)
+        return {"status": "error", "reason": str(exc)[:300]}
 
 
 @mcp.tool()
@@ -1586,8 +1880,9 @@ def echo_write_followup(
         if isinstance(body, dict):
             return body
         return {"status": "success", "body": body.strip(), "followup_number": followup_number}
-    except Exception as e:
-        return {"status": "error", "reason": str(e)}
+    except Exception as exc:
+        logger.warning("[Saturn] echo_write_followup failed", exc_info=exc)
+        return {"status": "error", "reason": str(exc)[:300]}
 
 
 @mcp.tool()
@@ -1606,8 +1901,9 @@ def echo_write_reply(
         if isinstance(body, dict):
             return body
         return {"status": "success", "body": body.strip()}
-    except Exception as e:
-        return {"status": "error", "reason": str(e)}
+    except Exception as exc:
+        logger.warning("[Saturn] echo_write_reply failed", exc_info=exc)
+        return {"status": "error", "reason": str(exc)[:300]}
 
 
 @mcp.tool()
@@ -1681,8 +1977,9 @@ def echo_linkedin_connection(
         if len(msg) > 300:
             msg = msg[:277] + "..."
         return {"status": "success", "message": msg, "chars": len(msg)}
-    except Exception as e:
-        return {"status": "error", "reason": str(e)}
+    except Exception as exc:
+        logger.warning("[Saturn] echo_linkedin_connection failed", exc_info=exc)
+        return {"status": "error", "reason": str(exc)[:300]}
 
 
 @mcp.tool()
@@ -1704,8 +2001,9 @@ def echo_linkedin_inmail(
             return msg
         msg = msg.strip()
         return {"status": "success", "message": msg}
-    except Exception as e:
-        return {"status": "error", "reason": str(e)}
+    except Exception as exc:
+        logger.warning("[Saturn] echo_linkedin_inmail failed", exc_info=exc)
+        return {"status": "error", "reason": str(exc)[:300]}
 
 
 @mcp.tool()
@@ -1719,8 +2017,9 @@ def hunter_score_profile(profile_text: str, niche: str) -> dict:
         if isinstance(raw, dict):
             return raw
         return _li_parse(raw)
-    except Exception as e:
-        return {"status": "error", "reason": str(e)}
+    except Exception as exc:
+        logger.warning("[Saturn] hunter_score_profile failed", exc_info=exc)
+        return {"status": "error", "reason": str(exc)[:300]}
 
 
 @mcp.tool()
@@ -1876,8 +2175,22 @@ def send_outreach(lead_id: int, draft_id: int) -> str:
             conn.commit()
             return json.dumps({"status": "failed", "error_type": "LOGIC_ERROR", "reason": "missing_email"})
 
-        subject = f"Follow-up from SATURN for {lead['name'] or 'Lead'}"
-        body = str(draft["draft_text"] or "")
+        default_subject = build_echo_subject(lead["name"] or "", "")
+        subject, body, draft_error = parse_email_draft_text(
+            str(draft["draft_text"] or ""),
+            default_subject,
+        )
+        if draft_error:
+            log_error(
+                conn,
+                "echo",
+                "send_outreach",
+                "LOGIC_ERROR",
+                "Stored draft is invalid",
+                f"draft_id={draft_id} error={draft_error}",
+            )
+            conn.commit()
+            return json.dumps({"status": "failed", "error_type": "LOGIC_ERROR", "reason": draft_error})
         send_result = email_send_tool(to_email, subject, body, int(lead_id), int(draft_id))
         log_agent(
             conn,
@@ -1962,8 +2275,8 @@ def extract_gemini_tokens(gemini_response: object | None, response_text: str = "
         if total is not None:
             try:
                 return max(0, int(total))
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as exc:
+                logger.debug("[Saturn] invalid Gemini usage total_token_count: %s", exc)
     estimated = len(response_text or "") // 4
     return max(0, estimated)
 
@@ -1971,7 +2284,7 @@ def extract_gemini_tokens(gemini_response: object | None, response_text: str = "
 def log_gemini_usage(conn: sqlite3.Connection, agent: str, action: str, gemini_response: object | None, response_text: str = "") -> int:
     tokens = extract_gemini_tokens(gemini_response, response_text)
     log_token_usage(conn, agent, action, tokens)
-    increment_service_daily_usage(conn, "gemini")
+    _safe_increment_service_daily_usage(conn, "gemini")
     return tokens
 
 
@@ -2085,7 +2398,7 @@ async def add_lead(name: str, company: str = '', contact: str = '',
             )
 
         existing = conn.execute(
-            "SELECT id FROM leads WHERE website_norm=? OR contact=? LIMIT 1",
+            "SELECT id FROM leads WHERE website_norm=? OR contact=? ORDER BY id ASC LIMIT 1",
             (website_norm, contact),
         ).fetchone()
         if existing:
@@ -2172,7 +2485,32 @@ async def add_lead(name: str, company: str = '', contact: str = '',
                             "reason": "linked_lead_not_found",
                         }
                     )
-                draft_text = build_echo_draft_text(lead_for_draft["name"] or "", lead_for_draft["company"] or "")
+                draft_subject = build_echo_subject(
+                    lead_for_draft["name"] or "",
+                    lead_for_draft["company"] or "",
+                )
+                draft_body = build_echo_draft_text(
+                    lead_for_draft["name"] or "",
+                    lead_for_draft["company"] or "",
+                )
+                draft_text = compose_email_draft(draft_subject, draft_body, draft_subject)
+                if not draft_text:
+                    log_error(
+                        conn,
+                        "echo",
+                        "draft_create",
+                        "LOGIC_ERROR",
+                        "Draft formatting failed",
+                        str(new_id),
+                    )
+                    conn.commit()
+                    return json.dumps(
+                        {
+                            "status": "failed",
+                            "error_type": "LOGIC_ERROR",
+                            "reason": "draft_format_failed",
+                        }
+                    )
                 draft_row = conn.execute(
                     """
                     INSERT INTO outreach_drafts (lead_id, draft_text, status, created_at, processed_at)
@@ -2225,15 +2563,15 @@ async def add_lead(name: str, company: str = '', contact: str = '',
                     "lead_score": 0,
                     "email_status": final_email_status,
                 })
-            except Exception as _e:
-                pass
+            except Exception as notion_exc:
+                _log_notion_fail_open(conn, "hunter", "add_lead_notion_sync", notion_exc, f"lead_id={new_id}")
         return json.dumps(
             {"status": "success", "lead_id": new_id, "website": website_norm, "email_status": final_email_status}
         )
     except sqlite3.IntegrityError as exc:
         if "ux_leads_website_norm" in str(exc):
             duplicate = conn.execute(
-                "SELECT id FROM leads WHERE website_norm=? LIMIT 1", (website_norm,)
+                "SELECT id FROM leads WHERE website_norm=? ORDER BY id ASC LIMIT 1", (website_norm,)
             ).fetchone()
             return json.dumps(
                 {
@@ -2256,7 +2594,7 @@ async def check_lead_exists(contact_url: str) -> str:
         return json.dumps({"exists": False, "website": None})
     conn = db_conn()
     row = conn.execute(
-        "SELECT id FROM leads WHERE website_norm = ? OR contact = ? LIMIT 1",
+        "SELECT id FROM leads WHERE website_norm = ? OR contact = ? ORDER BY id ASC LIMIT 1",
         (website_norm, contact_url),
     ).fetchone()
     conn.close()
@@ -2407,7 +2745,7 @@ def _insert_hunter_lead(
     )
     if int(cursor.rowcount or 0) == 0:
         existing = conn.execute(
-            "SELECT id FROM leads WHERE website_norm=? OR contact=? LIMIT 1",
+            "SELECT id FROM leads WHERE website_norm=? OR contact=? ORDER BY id ASC LIMIT 1",
             (website_norm, contact),
         ).fetchone()
         return "duplicate", int(existing["id"]) if existing else None
@@ -2664,7 +3002,7 @@ async def hunter_extract_leads(
                 continue
 
             exists = conn.execute(
-                "SELECT id FROM leads WHERE website_norm=? LIMIT 1",
+                "SELECT id FROM leads WHERE website_norm=? ORDER BY id ASC LIMIT 1",
                 (website_norm,),
             ).fetchone()
             if exists:
@@ -2936,8 +3274,17 @@ async def trigger_echo_draft(lead_id: int) -> str:
         conn.commit()
         conn.close()
         return f"Lead {lead_id} has no email. Draft skipped safely."
+    draft_subject = build_echo_subject(name or "", company or "")
     message = build_echo_draft_text(name, company)
-    draft_text = message
+    draft_text = compose_email_draft(draft_subject, message, draft_subject)
+    if not draft_text:
+        log_error(conn, "echo", "trigger_draft", "LOGIC_ERROR", "Draft formatting failed", str(lead_id))
+        conn.commit()
+        conn.close()
+        return f"Lead {lead_id} draft formatting failed."
+    deleted_active = delete_active_drafts_for_lead(conn, lead_id)
+    if deleted_active:
+        log_agent(conn, "Echo", "active_drafts_replaced", f"lead_id={lead_id} count={deleted_active}", "success")
 
     draft = conn.execute(
         """
@@ -2950,15 +3297,15 @@ async def trigger_echo_draft(lead_id: int) -> str:
     if _notion:
         try:
             _notion.sync_draft({
-                "saturn_id": f"draft_{lead_id}_{int(time.time())}",
-                "name": f"Outreach to {lead_id}",
-                "body": message or "",
+                "saturn_id": f"draft_{lead_id}_{draft_id}",
+                "name": draft_subject or f"Outreach to {lead_id}",
+                "body": ensure_email_signature(message or ""),
                 "status": "Pending Approval",
                 "channel": "Email",
                 "agent": "Echo",
             })
-        except Exception as _e:
-            pass
+        except Exception as notion_exc:
+            _log_notion_fail_open(conn, "echo", "trigger_echo_draft_notion_sync", notion_exc, f"lead_id={lead_id}")
 
     # Telegram Approval Message
     env_vars = telegram_env()
@@ -3005,13 +3352,20 @@ async def trigger_echo_draft(lead_id: int) -> str:
 
 @mcp.tool()
 def trigger_echo_for_pending_leads(limit: int = 10, dry_run: bool = False, lead_id: int | None = None) -> dict:
-    """Create pending outreach drafts for existing eligible leads without drafts."""
+    """Create pending outreach drafts for existing eligible leads with deterministic selection."""
     conn = db_conn()
     drafted = 0
     skipped = 0
     errors = 0
+    eligible_leads_count = 0
+    processed_lead_id: int | None = int(lead_id) if lead_id is not None else None
+    reason_if_skipped = ""
+    draft_ids: list[int] = []
+    replaced_active_drafts = 0
+    stale_drafts_deleted = 0
     run_id = f"run_echo_{int(time.time() * 1000000)}"
     started_at = int(time.time())
+    requested_lead_id = int(lead_id) if lead_id is not None else None
     try:
         conn.execute(
             """
@@ -3023,23 +3377,67 @@ def trigger_echo_for_pending_leads(limit: int = 10, dry_run: bool = False, lead_
         conn.commit()
         batch_limit = max(1, int(limit or 10))
 
-        query_sql = """
-            SELECT id, name, company, email, notes
-            FROM leads
-            WHERE email_status IN ('verified','guessed','found')
-              AND manual_override = 0
-              AND id NOT IN (SELECT lead_id FROM outreach_drafts)
-        """
-        query_args: tuple[object, ...]
-        if lead_id is not None:
-            query_sql += " AND id=? LIMIT 1"
-            query_args = (int(lead_id),)
+        stale_drafts_deleted = (
+            conn.execute(
+                """
+                DELETE FROM outreach_drafts
+                WHERE lower(COALESCE(status,'')) IN ('pending','approved')
+                  AND julianday(COALESCE(created_at, CURRENT_TIMESTAMP))
+                      < julianday('now', '+5 hours', '+30 minutes', '-1 day')
+                """
+            ).rowcount
+            or 0
+        )
+        conn.commit()
+
+        def _eligible_target_rows() -> list[sqlite3.Row]:
+            nonlocal reason_if_skipped
+            target_row = conn.execute(
+                """
+                SELECT id, name, company, email, notes, email_status, manual_override
+                FROM leads
+                WHERE id=?
+                LIMIT 1
+                """,
+                (requested_lead_id,),
+            ).fetchone()
+            if not target_row:
+                reason_if_skipped = "lead_not_found"
+                return []
+            if int(target_row["manual_override"] or 0) != 0:
+                reason_if_skipped = "manual_override_enabled"
+                return []
+            if str(target_row["email_status"] or "").strip().lower() not in {"verified", "guessed", "found"}:
+                reason_if_skipped = "email_not_eligible"
+                return []
+            return [target_row]
+
+        if requested_lead_id is not None:
+            rows = _eligible_target_rows()
         else:
-            query_sql += " LIMIT ?"
-            query_args = (batch_limit,)
+            rows = conn.execute(
+                """
+                SELECT id, name, company, email, notes, email_status, manual_override
+                FROM leads
+                WHERE lower(COALESCE(email_status,'')) IN ('verified','guessed','found')
+                  AND COALESCE(manual_override,0)=0
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM outreach_drafts od
+                      WHERE od.lead_id=leads.id
+                        AND lower(COALESCE(od.status,'')) IN ('pending','approved')
+                  )
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (batch_limit,),
+            ).fetchall()
+            if not rows:
+                reason_if_skipped = "no_eligible_leads"
+
+        eligible_leads_count = len(rows)
 
         if dry_run:
-            rows = conn.execute(query_sql, query_args).fetchall()
             conn.execute(
                 "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
                 (int(time.time()), "dry_run", run_id),
@@ -3048,6 +3446,10 @@ def trigger_echo_for_pending_leads(limit: int = 10, dry_run: bool = False, lead_
             return {
                 "status": "dry_run",
                 "count": len(rows),
+                "eligible_leads_count": eligible_leads_count,
+                "processed_lead_id": processed_lead_id,
+                "reason_if_skipped": reason_if_skipped,
+                "stale_drafts_deleted": stale_drafts_deleted,
                 "eligible_leads": [
                     {
                         "id": int(row["id"]),
@@ -3059,22 +3461,6 @@ def trigger_echo_for_pending_leads(limit: int = 10, dry_run: bool = False, lead_
                 "estimated_tokens_per_draft": 300,
                 "estimated_total_tokens": len(rows) * 300,
             }
-
-        conn.execute(
-            """
-            DELETE FROM outreach_drafts
-            WHERE lower(COALESCE(status,'')) IN ('pending','approved')
-              AND (
-                instr(COALESCE(draft_text,''), '[') > 0
-                OR instr(COALESCE(draft_text,''), ']') > 0
-                OR lower(COALESCE(draft_text,'')) LIKE '%please tell me%'
-                OR lower(COALESCE(draft_text,'')) NOT LIKE 'subject:%'
-              )
-            """
-        )
-        conn.commit()
-
-        rows = conn.execute(query_sql, query_args).fetchall()
 
         if not rows:
             conn.execute(
@@ -3088,153 +3474,353 @@ def trigger_echo_for_pending_leads(limit: int = 10, dry_run: bool = False, lead_
                 "skipped": 0,
                 "errors": 0,
                 "detail": "no eligible leads",
+                "eligible_leads_count": eligible_leads_count,
+                "processed_lead_id": processed_lead_id,
+                "reason_if_skipped": reason_if_skipped,
+                "draft_ids": draft_ids,
+                "replaced_active_drafts": replaced_active_drafts,
+                "stale_drafts_deleted": stale_drafts_deleted,
             }
 
         for lead in rows:
-            lead_id = int(lead["id"])
+            current_lead_id = int(lead["id"])
+            processed_lead_id = current_lead_id
             lead_name = str(lead["name"] or "").strip()
             lead_company = str(lead["company"] or "").strip()
             lead_notes = str(lead["notes"] or "").strip()
-            signature = (
-                "\n\nBest regards,\n"
-                "Navin Rana\n"
-                "AI Automation Engineer\n"
-                "FlowCraft Automations\n"
-                "theautomationguy.navin@gmail.com"
-            )
-
-            def _is_bad(text: str) -> bool:
-                t = text.lower()
-                if not text.startswith("Subject:"):
-                    return True
-                if "\n\n" not in text:
-                    return True
-                subject_block, body = text.split("\n\n", 1)
-                if "\n" in subject_block.strip():
-                    return True
-                body = body.strip()
-                if not body:
-                    return True
-                body_for_checks = body.split("\n\nBest regards,\n", 1)[0].strip()
-                body_sentences = len([s for s in re.split(r"[.!?]+", body_for_checks) if s.strip()])
-                cta_mentions = t.count("15-minute call") + t.count("15 minute call")
-                return (
-                    "[" in text or "]" in text or
-                    "<" in text or ">" in text or
-                    "your company" in t or
-                    "decision maker" in t or
-                    "please tell me" in t or
-                    "here are" in t or
-                    "here is a draft" in t or
-                    "option 1" in t or
-                    len(text.split()) > 120 or
-                    body_sentences < 3 or
-                    cta_mentions != 1 or
-                    not body_for_checks.endswith((".", "!", "?"))
-                )
-
-            def _with_signature(text: str) -> str:
-                base = str(text or "").strip()
-                if not base:
-                    return base
-                for marker in ("\n\nBest regards,\n", "\n\nBest,\n"):
-                    if marker in base:
-                        base = base.split(marker, 1)[0].rstrip()
-                        break
-                return f"{base}{signature}"
-
-            def _fallback_draft() -> str:
-                fallback_subject_target = lead_company or recipient
-                fallback_context = (lead_notes or "manual reporting and follow-ups").strip().rstrip(".")
-                return _with_signature(
-                    f"Subject: Streamlining {fallback_subject_target} workflows\n\n"
-                    f"Hi {recipient},\n\n"
-                    f"I noticed {fallback_subject_target} is still spending time on {fallback_context.lower()}. "
-                    f"I help teams automate reporting, follow-ups, and handoffs with n8n and Python agents. "
-                    f"Would you be open to a 15-minute call next week to see what this could look like for {fallback_subject_target}?"
-                )
 
             if not lead_name and not lead_company:
                 log_error(conn, "echo", "outreach_draft", "MISSING_CONTEXT",
-                          "Lead missing name and company", str(lead_id))
+                          "Lead missing name and company", str(current_lead_id))
+                reason_if_skipped = "missing_context"
                 errors += 1
+                skipped += 1
                 conn.commit()
                 continue
 
+            replaced_active_drafts += (
+                conn.execute(
+                    """
+                    DELETE FROM outreach_drafts
+                    WHERE lead_id=?
+                      AND lower(COALESCE(status,'')) IN ('pending','approved')
+                    """,
+                    (current_lead_id,),
+                ).rowcount
+                or 0
+            )
+            conn.commit()
+
             recipient = lead_name if lead_name else "team"
-            target = lead_company if lead_company else recipient
-            context_line = f"Context: {lead_notes}" if lead_notes else ""
+            target = lead_company if lead_company else "your business"
+            target_lc = target.lower()
+            inferred_issue = "internal workflows start breaking as volume increases and more work depends on timely handoffs"
+            normalized_note = lead_notes.strip().rstrip(".")
+            normalized_note_clause = ""
+            if normalized_note:
+                normalized_note_clause = normalized_note[:1].lower() + normalized_note[1:]
+            if any(term in target_lc for term in ("support", "service", "care", "helpdesk")):
+                inferred_issue = "handoffs and escalation response start slipping as request volume increases"
+            elif any(term in target_lc for term in ("agency", "studio", "creative", "marketing", "automation")):
+                inferred_issue = "client delivery handoffs and approvals get harder to coordinate as project volume increases"
+            elif any(term in target_lc for term in ("dispatch", "field", "logistics", "ops", "backoffice", "approval")):
+                inferred_issue = "handoffs, approvals, and status updates get harder to coordinate as workload increases"
+            context_line = lead_notes if lead_notes else inferred_issue
 
-            prompt = f"""
-You are a senior B2B outbound strategist.
+            def _compose_draft(subject_text: str, body_text: str) -> str:
+                return compose_email_draft(subject_text, body_text, build_echo_subject(lead_name, lead_company))
 
-Write a high-converting cold email.
+            def _format_body(body_text: str) -> str:
+                body_text = strip_email_signature(str(body_text or "").strip())
+                body_text = body_text.replace("\r\n", "\n").replace("\r", "\n").strip()
+                body_text = re.sub(r"\n{3,}", "\n\n", body_text)
+                greeting = f"Hi {recipient},"
+                paragraphs = [p.strip() for p in body_text.split("\n\n") if p.strip()]
+                if not paragraphs:
+                    return ""
+                if paragraphs[0] == greeting:
+                    paragraphs = paragraphs[1:]
+                elif paragraphs[0].startswith(greeting):
+                    first_paragraph = paragraphs[0][len(greeting):].strip()
+                    if first_paragraph:
+                        paragraphs[0] = first_paragraph
+                    else:
+                        paragraphs = paragraphs[1:]
+                if len(paragraphs) < 3:
+                    return ""
+                return f"""Hi {recipient},
 
-Context:
+{paragraphs[0]}
+
+{paragraphs[1]}
+
+{paragraphs[2]}""".strip()
+
+            def _parse_response(raw: str) -> tuple[str, str]:
+                raw = str(raw or "").strip()
+                if not raw.startswith("Subject:"):
+                    return "", ""
+                split_index = raw.find("\n")
+                if split_index <= 0:
+                    return "", ""
+                subject_text = raw[:split_index].replace("Subject:", "", 1).strip()
+                body_text = raw[split_index:].strip()
+                body_text = _format_body(body_text)
+                if not subject_text or not body_text:
+                    return "", ""
+                return subject_text, body_text
+
+            def _is_low_quality(body_text: str) -> bool:
+                t = body_text.lower()
+                bad_patterns = [
+                    "we specialize",
+                    "hope you're doing well",
+                    "quick thought",
+                    "just checking",
+                    "i came across",
+                    "please tell me",
+                    "here are",
+                    "options",
+                    "teams in your space often",
+                    "[",
+                    "]",
+                ]
+                sentence_count = len([s for s in re.split(r"[.!?]+", body_text) if s.strip()])
+                word_count = len(body_text.split())
+                paragraph_count = len([block for block in body_text.split("\n\n") if block.strip()])
+                cta_mentions = t.count("15-minute call") + t.count("15 minute call")
+                paragraph_blocks = [block for block in body_text.split("\n\n") if block.strip()]
+                content_paragraphs = paragraph_blocks[1:] if paragraph_blocks else []
+                return (
+                    any(pattern in t for pattern in bad_patterns) or
+                    "subject:" in t or
+                    "__subject__:" in t or
+                    "<" in body_text or
+                    ">" in body_text or
+                    "your company" in t or
+                    "decision maker" in t or
+                    "your name" in t or
+                    "company name" in t or
+                    not body_text.startswith(f"Hi {recipient},\n\n") or
+                    word_count < 80 or
+                    word_count > 120 or
+                    paragraph_count != 4 or
+                    len(content_paragraphs) != 3 or
+                    any(len([line for line in paragraph.split("\n") if line.strip()]) > 3 for paragraph in content_paragraphs) or
+                    sentence_count < 3 or
+                    sentence_count > 4 or
+                    cta_mentions != 1
+                )
+
+            def _fallback_draft() -> tuple[str, str]:
+                note_lower = lead_notes.lower()
+
+                if (
+                    "dispatch" in note_lower
+                    or "invoice" in note_lower
+                    or "payment" in note_lower
+                    or "field job" in note_lower
+                    or "field jobs" in note_lower
+                ):
+                    fallback_subject = f"Tightening dispatch and invoicing at {target}"
+                    if normalized_note_clause:
+                        first_paragraph = (
+                            f"Hi {recipient}, I noticed {target} {normalized_note_clause}, which usually slows handoffs "
+                            f"and makes billing steps easy to miss when work picks up."
+                        )
+                    else:
+                        first_paragraph = (
+                            f"Hi {recipient}, I noticed {target} is likely seeing scheduling and follow-up friction as workload increases, "
+                            f"which usually slows handoffs and makes billing steps easier to miss when work picks up."
+                        )
+                    second_paragraph = (
+                        f"We can move that workflow into Python and n8n so jobs route automatically, follow-ups trigger on time, "
+                        f"and Notion stays current without anyone stitching updates together by hand."
+                    )
+                elif "approval" in note_lower or ("notion" in note_lower and "email" in note_lower):
+                    fallback_subject = f"Cleaning up approval flow at {target}"
+                    if normalized_note_clause:
+                        first_paragraph = (
+                            f"Hi {recipient}, I noticed {target} {normalized_note_clause}, which tends to create lag, "
+                            f"duplicate work, and unclear ownership before delivery can even move forward."
+                        )
+                    else:
+                        first_paragraph = (
+                            f"Hi {recipient}, I noticed {target} is likely feeling friction around approvals and ownership checkpoints, "
+                            f"which tends to create lag, duplicate work, and unclear ownership before delivery can even move forward."
+                        )
+                    second_paragraph = (
+                        f"We can centralize that flow with Python and n8n so approvals sync automatically, status updates land in Notion, "
+                        f"and the ops team stops piecing context together from multiple places or checking separate inboxes for the latest decision."
+                    )
+                elif "support" in note_lower or "escalation" in note_lower or "report" in note_lower:
+                    fallback_subject = f"Reducing reporting drag at {target}"
+                    if normalized_note_clause:
+                        first_paragraph = (
+                            f"Hi {recipient}, I noticed {target} {normalized_note_clause}, which usually burns time right "
+                            f"when the team needs faster visibility for managers and faster responses for clients."
+                        )
+                    else:
+                        first_paragraph = (
+                            f"Hi {recipient}, I noticed {target} is likely spending too much effort coordinating escalations and status visibility, "
+                            f"which usually burns time right when the team needs faster responses for clients and clearer updates for managers."
+                        )
+                    second_paragraph = (
+                        f"We can automate escalation routing and reporting with Python, n8n, and Notion so leadership gets clean updates "
+                        f"without manual rollups, status chasing, or extra wrap-up work every week."
+                    )
+                else:
+                    if normalized_note_clause:
+                        first_paragraph = (
+                            f"Hi {recipient}, I noticed {target} {normalized_note_clause}, which is usually where manual delays and dropped "
+                            f"follow-ups start building as volume grows and more moving pieces depend on timely updates."
+                        )
+                    else:
+                        first_paragraph = (
+                            f"Hi {recipient}, I noticed {target} likely sees workflow friction once volume increases, "
+                            f"which tends to slow execution as more requests depend on timely handoffs and clear ownership."
+                        )
+                    second_paragraph = (
+                        f"I would map that workflow into Python, n8n, and Notion so routing, updates, and reporting happen automatically "
+                        f"instead of getting pushed forward by hand or delayed until someone has time to reconcile the latest status."
+                    )
+                    fallback_subject = f"Reducing internal friction at {target}"
+
+                fallback_body = (
+                    f"{first_paragraph}\n\n"
+                    f"{second_paragraph}\n\n"
+                    f"Would you be open to a quick 15-minute call next week to see what that could look like for {target}?"
+                )
+                return fallback_subject, fallback_body
+
+            def _guaranteed_draft() -> tuple[str, str, str]:
+                fallback_subject, fallback_body = _fallback_draft()
+                fallback_text = _compose_draft(fallback_subject, fallback_body)
+                if fallback_text:
+                    return fallback_subject, fallback_body, fallback_text
+
+                deterministic_subject = build_echo_subject(lead_name, lead_company)
+                deterministic_body = build_echo_draft_text(lead_name, lead_company)
+                deterministic_text = compose_email_draft(
+                    deterministic_subject,
+                    deterministic_body,
+                    deterministic_subject,
+                )
+                if deterministic_text:
+                    return deterministic_subject, deterministic_body, deterministic_text
+
+                hard_subject = f"Automation idea for {target}"
+                hard_body = f"""Hi {recipient},
+
+I noticed {target} is likely spending more time on approvals and internal status updates as work volume increases.
+
+We can replace that with lightweight automation so routing, approvals, and updates happen automatically instead of depending on manual follow-ups.
+
+Would you be open to a quick 15-minute call next week to see whether that would help {target}?"""
+                hard_text = compose_email_draft(hard_subject, hard_body, hard_subject)
+                if hard_text:
+                    return hard_subject, hard_body, hard_text
+                raise RuntimeError("deterministic_draft_build_failed")
+
+            prompt = f"""You are writing a highly personalized cold email as a senior AI automation consultant.
+
 Recipient: {recipient}
 Company: {target}
-{context_line}
+Context: {context_line}
 
-STRICT RULES:
-- Do NOT use placeholders (no [], no generic tags)
-- Do NOT ask for missing information
-- Make reasonable assumptions if data is missing
-- Max 80 words
-- Exactly 1 CTA (15-minute call)
-- No fluff phrases (no "hope this finds you well")
+IMPORTANT:
+This is NOT a template email.
+Write it like you actually researched the business.
 
-OUTPUT FORMAT (STRICT):
-Subject: <one line>
+WRITING STYLE:
+- Natural, human, sharp
+- No corporate fluff
+- No generic phrases
+- No placeholders
+- No repetition
+- Sound like a consultant who understands operations
 
-<body max 3-4 sentences>
+STRUCTURE:
+Subject: one specific, relevant improvement idea for {target}
+
+Hi {recipient},
+
+Paragraph 1:
+Make a specific observation about their business or a realistic inefficiency.
+(If no data, infer based on company type — do NOT say “I don’t have enough info”)
+
+Paragraph 2:
+Explain a practical improvement using automation (mention real tools: Python, n8n, Notion if relevant).
+Make it sound like a real solution, not a pitch.
+
+Paragraph 3:
+Simple CTA → 15-min call
+
+RULES:
+- 80–120 words
+- 3 paragraphs only
+- Each paragraph 1–2 sentences
+- Proper spacing (blank line between paragraphs)
+- MUST feel written for THIS company only
+
+OUTPUT:
+Return ONLY:
+Subject + blank line + email body
 """
 
-            attempt = 0
+            attempts = 0
+            max_attempts = 3
+            subject = ""
+            body = ""
             text = ""
+            force_insert = False
             llm_failed = False
             llm_failure_detail = "LLM failed after retries"
             result: str | dict = ""
 
-            while attempt < 2:
+            while attempts < max_attempts:
                 try:
                     result = call_llm(prompt=prompt, agent="echo", action="outreach_draft")
                 except Exception as exc:
                     llm_failed = True
                     llm_failure_detail = str(exc)[:300]
-                    attempt += 1
+                    attempts += 1
                     continue
 
                 if isinstance(result, dict):
                     llm_failed = True
                     llm_failure_detail = str(result.get("detail") or result)
-                    attempt += 1
+                    attempts += 1
                     continue
 
-                text = _with_signature(str(result or "").strip())
+                raw = str(result or "").strip()
+                subject, body = _parse_response(raw)
+                text = _compose_draft(subject, body) if subject and body else ""
 
-                if not _is_bad(text):
+                if subject and body and not _is_low_quality(body):
                     break
 
                 llm_failed = True
-                attempt += 1
+                attempts += 1
 
-            if _is_bad(text):
+            if not subject or not body or _is_low_quality(body) or not text:
                 log_error(
                     conn,
                     "echo",
                     "outreach_draft",
                     "LLM_FAILURE",
                     llm_failure_detail,
-                    str(lead_id),
+                    str(current_lead_id),
                 )
-                text = _fallback_draft()
+                subject, body, text = _guaranteed_draft()
+                force_insert = bool(text)
                 log_error(
                     conn,
                     "echo",
                     "outreach_draft",
                     "FALLBACK_USED",
                     "Fallback draft inserted",
-                    str(lead_id),
+                    str(current_lead_id),
                 )
                 errors += 1
             elif llm_failed:
@@ -3244,24 +3830,34 @@ Subject: <one line>
                     "outreach_draft",
                     "LLM_FAILURE",
                     llm_failure_detail,
-                    str(lead_id),
+                    str(current_lead_id),
                 )
 
-            if _is_bad(text):
+            body_for_insert = body if subject and body else ""
+            if not force_insert and (not subject or _is_low_quality(body_for_insert) or not text):
                 log_error(conn, "echo", "outreach_draft", "LOGIC_ERROR",
-                          "Fallback draft validation failed", str(lead_id))
+                          "Draft validation failed, using deterministic fallback", str(current_lead_id))
+                subject, body, text = _guaranteed_draft()
+                force_insert = bool(text)
+                log_error(
+                    conn,
+                    "echo",
+                    "outreach_draft",
+                    "FALLBACK_USED",
+                    "Deterministic fallback draft inserted after validation retry",
+                    str(current_lead_id),
+                )
                 errors += 1
-                conn.commit()
-                continue
 
-            conn.execute(
+            insert_row = conn.execute(
                 """
                 INSERT INTO outreach_drafts (lead_id, draft_text, status, created_at)
                 VALUES (?, ?, 'pending', datetime('now', '+5 hours', '+30 minutes'))
                 """,
-                (lead_id, text[:1000]),
+                (current_lead_id, text[:1000]),
             )
-            log_agent(conn, "echo", "draft_created", f"lead_id={lead_id}", "ok")
+            draft_ids.append(int(insert_row.lastrowid))
+            log_agent(conn, "echo", "draft_created", f"lead_id={current_lead_id} draft_id={int(insert_row.lastrowid)}", "ok")
             drafted += 1
             conn.commit()
 
@@ -3270,7 +3866,18 @@ Subject: <one line>
             (int(time.time()), "ok", run_id),
         )
         conn.commit()
-        return {"status": "ok", "drafted": drafted, "skipped": skipped, "errors": errors}
+        return {
+            "status": "ok",
+            "drafted": drafted,
+            "skipped": skipped,
+            "errors": errors,
+            "eligible_leads_count": eligible_leads_count,
+            "processed_lead_id": processed_lead_id,
+            "reason_if_skipped": reason_if_skipped,
+            "draft_ids": draft_ids,
+            "replaced_active_drafts": replaced_active_drafts,
+            "stale_drafts_deleted": stale_drafts_deleted,
+        }
     except Exception as exc:
         log_error(conn, "echo", "outreach_draft", "LOGIC_ERROR", str(exc)[:300], "")
         conn.execute(
@@ -3283,6 +3890,12 @@ Subject: <one line>
             "error": "LOGIC_ERROR",
             "detail": str(exc)[:300],
             "agent": "echo",
+            "eligible_leads_count": eligible_leads_count,
+            "processed_lead_id": processed_lead_id,
+            "reason_if_skipped": reason_if_skipped,
+            "draft_ids": draft_ids,
+            "replaced_active_drafts": replaced_active_drafts,
+            "stale_drafts_deleted": stale_drafts_deleted,
         }
     finally:
         conn.close()
@@ -3306,7 +3919,7 @@ async def update_lead_status(
     """Update lead status with strict transition rules and manual override support."""
     next_status = (status or "").strip().lower()
     conn = db_conn()
-    valid_statuses = {"new", "contacted", "qualified", "proposal", "won", "lost"}
+    valid_statuses = {"new", "contacted", "qualified", "lost"}
     if next_status not in valid_statuses:
         log_error(
             conn,
@@ -3397,7 +4010,7 @@ async def update_lead_status(
             """,
             (next_status, notes, now, now, now, follow_due, now, next_override_value, lead_id),
         )
-    elif next_status in ("won", "lost"):
+    elif next_status == "lost":
         conn.execute(
             "UPDATE leads SET status=?, notes=?, follow_up_due_at=NULL, updated_at=?, manual_override=? WHERE id=?",
             (next_status, notes, now, next_override_value, lead_id),
@@ -3428,18 +4041,18 @@ async def update_lead_status(
                 status="Success",
                 detail=f"{lead_id}: {current_status}->{next_status}",
             )
-    except Exception:
-        pass
+    except Exception as notion_exc:
+        _log_notion_fail_open(conn, "saturn", "lead_status_update_notion_sync", notion_exc, f"lead_id={lead_id}")
     conn.close()
     return json.dumps({"status": "ok", "lead_id": lead_id, "from": current_status, "to": next_status})
 
 
 def smtp_credentials_available() -> bool:
-    host = os.environ.get("SMTP_HOST", "").strip()
+    if _missing_smtp_config_fields():
+        return False
     username = os.environ.get("SMTP_USER", "").strip()
-    password = os.environ.get("SMTP_PASS", "").strip()
     sender = os.environ.get("SMTP_FROM", username).strip()
-    return all([host, username, password, sender])
+    return bool(sender)
 
 
 def gmail_credentials_available() -> bool:
@@ -3492,6 +4105,20 @@ def log_email_send_attempt(
     sent_at: str | None = None,
 ) -> bool:
     try:
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM email_send_log
+            WHERE lead_id=?
+              AND COALESCE(draft_id, -1)=COALESCE(?, -1)
+              AND lower(status)=lower(?)
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (lead_id, draft_id, status),
+        ).fetchone()
+        if existing:
+            return True
         conn.execute(
             """
             INSERT INTO email_send_log (lead_id, draft_id, status, attempt_count, error_category, sent_at)
@@ -3531,18 +4158,30 @@ def smtp_send(to_email: str, subject: str, body: str) -> None:
     import smtplib
 
     host = os.environ.get("SMTP_HOST", "").strip()
-    port = int(os.environ.get("SMTP_PORT", "587"))
+    try:
+        port = int(os.environ.get("SMTP_PORT", "587"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("SMTP_PORT is invalid") from exc
     username = os.environ.get("SMTP_USER", "").strip()
     password = os.environ.get("SMTP_PASS", "").strip()
-    sender = os.environ.get("SMTP_FROM", username)
+    sender = os.environ.get("SMTP_FROM", username).strip()
+    recipient = (to_email or "").strip()
+    normalized_subject = _sanitize_email_subject(subject)
+    normalized_body = ensure_email_signature(body)
     if not all([host, username, password, sender]):
         raise RuntimeError("SMTP credentials are not configured")
+    if not recipient:
+        raise RuntimeError("SMTP recipient is missing")
+    if not normalized_subject:
+        raise RuntimeError("SMTP subject is missing")
+    if not normalized_body:
+        raise RuntimeError("SMTP body is missing")
 
     msg = EmailMessage()
     msg["From"] = sender
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.set_content(body)
+    msg["To"] = recipient
+    msg["Subject"] = normalized_subject
+    msg.set_content(normalized_body)
 
     with smtplib.SMTP(host, port, timeout=20) as smtp:
         smtp.starttls()
@@ -3557,13 +4196,22 @@ def gmail_api_send(to_email: str, subject: str, body: str) -> None:
 
     access_token = os.environ.get("GMAIL_ACCESS_TOKEN", "").strip()
     sender = os.environ.get("GMAIL_SENDER", "me")
+    recipient = (to_email or "").strip()
+    normalized_subject = _sanitize_email_subject(subject)
+    normalized_body = ensure_email_signature(body)
     if not access_token:
         raise RuntimeError("Gmail API access token missing")
+    if not recipient:
+        raise RuntimeError("Gmail recipient is missing")
+    if not normalized_subject:
+        raise RuntimeError("Gmail subject is missing")
+    if not normalized_body:
+        raise RuntimeError("Gmail body is missing")
 
     msg = EmailMessage()
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.set_content(body)
+    msg["To"] = recipient
+    msg["Subject"] = normalized_subject
+    msg.set_content(normalized_body)
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
     payload = json.dumps({"raw": raw}).encode("utf-8")
     req = Request(
@@ -3575,8 +4223,8 @@ def gmail_api_send(to_email: str, subject: str, body: str) -> None:
         },
         method="POST",
     )
-    with urlopen(req, timeout=20):
-        pass
+    with urlopen(req, timeout=20) as response:
+        response.read()
 
 
 @mcp.tool()
@@ -3591,41 +4239,8 @@ async def send_outreach_email(
     """Send outreach email with 1 retry max, daily cap, and categorized failures."""
     conn = db_conn()
     try:
-        if draft_id and draft_id > 0:
-            draft_row = conn.execute(
-                "SELECT id, lead_id, draft_text, status FROM outreach_drafts WHERE id=?",
-                (draft_id,)
-            ).fetchone()
-            if not draft_row:
-                return {"status": "error", "error": "draft_not_found",
-                        "detail": f"draft_id {draft_id} does not exist"}
-            already_sent = conn.execute(
-                "SELECT 1 FROM email_send_log WHERE draft_id=? AND lower(status)='sent' LIMIT 1",
-                (draft_id,),
-            ).fetchone()
-            if already_sent:
-                return json.dumps({"status": "ok", "detail": "already_sent"})
-            if str(draft_row["status"]).lower() != "approved":
-                return {"status": "error", "error": "draft_not_approved",
-                        "detail": f"draft_id {draft_id} status is '{draft_row['status']}', must be 'approved'"}
-            if int(draft_row["lead_id"]) != int(lead_id):
-                return {"status": "error", "error": "lead_mismatch",
-                        "detail": f"draft lead_id {draft_row['lead_id']} does not match lead_id {lead_id}"}
-            body = str(draft_row["draft_text"] or "").strip()
-            if not body:
-                return {"status": "error", "error": "empty_draft",
-                        "detail": f"draft_id {draft_id} has empty draft_text"}
-            if body.lower().startswith("subject:"):
-                body_lines = body.splitlines()
-                parsed_subject = body_lines[0][len("Subject:"):].strip()
-                parsed_body = "\n".join(body_lines[1:]).strip()
-                if parsed_subject:
-                    subject = parsed_subject
-                if parsed_body:
-                    body = parsed_body
-
         lead = conn.execute(
-            "SELECT email, status, email_status FROM leads WHERE id=?",
+            "SELECT id, name, company, email, status, email_status FROM leads WHERE id=?",
             (lead_id,),
         ).fetchone()
         if not lead:
@@ -3633,9 +4248,125 @@ async def send_outreach_email(
             conn.commit()
             return json.dumps({"status": "failed", "error_type": "DB_ERROR", "reason": "lead_not_found"})
 
+        lead_name = str(lead["name"] or "").strip()
+        lead_company = str(lead["company"] or "").strip()
+        default_subject = build_echo_subject(lead_name, lead_company)
+        target_draft_id = int(draft_id or 0) if draft_id and int(draft_id or 0) > 0 else None
+        normalized_subject = ""
+        normalized_body = ""
+
+        if target_draft_id is not None:
+            draft_row = conn.execute(
+                "SELECT id, lead_id, draft_text, status FROM outreach_drafts WHERE id=?",
+                (target_draft_id,),
+            ).fetchone()
+            if not draft_row:
+                log_error(conn, "echo", "send_email", "DB_ERROR", "Draft not found", str(target_draft_id))
+                conn.commit()
+                return json.dumps({"status": "error", "error": "draft_not_found", "detail": f"draft_id {target_draft_id} does not exist"})
+            already_sent = conn.execute(
+                "SELECT 1 FROM email_send_log WHERE draft_id=? AND lower(status)='sent' ORDER BY id DESC LIMIT 1",
+                (target_draft_id,),
+            ).fetchone()
+            if already_sent:
+                return json.dumps({"status": "ok", "detail": "already_sent"})
+            draft_status = str(draft_row["status"] or "").strip().lower()
+            if draft_status not in {"approved", "sent"}:
+                log_error(
+                    conn,
+                    "echo",
+                    "send_email",
+                    "LOGIC_ERROR",
+                    "Draft not approved",
+                    f"draft_id={target_draft_id} status={draft_status or 'null'}",
+                )
+                conn.commit()
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": "draft_not_approved",
+                        "detail": f"draft_id {target_draft_id} status is '{draft_row['status']}', must be 'approved'",
+                    }
+                )
+            if int(draft_row["lead_id"] or 0) != int(lead_id):
+                log_error(
+                    conn,
+                    "echo",
+                    "send_email",
+                    "LOGIC_ERROR",
+                    "Draft lead mismatch",
+                    f"draft_id={target_draft_id} draft_lead_id={draft_row['lead_id']} lead_id={lead_id}",
+                )
+                conn.commit()
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": "lead_mismatch",
+                        "detail": f"draft lead_id {draft_row['lead_id']} does not match lead_id {lead_id}",
+                    }
+                )
+            normalized_subject, normalized_body, draft_error = parse_email_draft_text(
+                str(draft_row["draft_text"] or ""),
+                default_subject,
+            )
+            if draft_error:
+                log_error(
+                    conn,
+                    "echo",
+                    "send_email",
+                    "LOGIC_ERROR",
+                    "Draft validation failed",
+                    f"draft_id={target_draft_id} error={draft_error}",
+                )
+                conn.commit()
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": "invalid_draft_format",
+                        "detail": f"draft_id {target_draft_id} validation failed: {draft_error}",
+                    }
+                )
+        else:
+            draft_payload = compose_email_draft(subject or default_subject, body, default_subject)
+            if not draft_payload:
+                log_error(conn, "echo", "send_email", "LOGIC_ERROR", "Email body missing", f"lead_id={lead_id}")
+                conn.commit()
+                return json.dumps({"status": "failed", "error_type": "LOGIC_ERROR", "reason": "body_missing"})
+            normalized_subject, normalized_body, draft_error = parse_email_draft_text(
+                draft_payload,
+                default_subject,
+            )
+            if draft_error:
+                log_error(
+                    conn,
+                    "echo",
+                    "send_email",
+                    "LOGIC_ERROR",
+                    "Email payload validation failed",
+                    f"lead_id={lead_id} error={draft_error}",
+                )
+                conn.commit()
+                return json.dumps({"status": "failed", "error_type": "LOGIC_ERROR", "reason": draft_error})
+
         lead_email = (lead["email"] or "").strip()
         lead_email_status = (lead["email_status"] or "").strip().lower()
-        if not lead_email or lead_email_status in {"not_found", "bounced"}:
+        recipient = (to_email or lead_email).strip()
+        if not recipient:
+            log_error(
+                conn,
+                "echo",
+                "send_email",
+                "LOGIC_ERROR",
+                "No email for lead",
+                str(lead_id),
+            )
+            conn.commit()
+            return json.dumps({"status": "failed", "error_type": "LOGIC_ERROR", "reason": "missing_email"})
+        if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", recipient):
+            log_error(conn, "echo", "send_email", "LOGIC_ERROR", "Invalid recipient email", recipient)
+            conn.commit()
+            return json.dumps({"status": "failed", "error_type": "LOGIC_ERROR", "reason": "invalid_recipient"})
+        if not to_email and (not lead_email or lead_email_status in {"not_found", "bounced"}):
             log_error(
                 conn,
                 "echo",
@@ -3647,11 +4378,18 @@ async def send_outreach_email(
             conn.commit()
             return json.dumps({"status": "failed", "error_type": "LOGIC_ERROR", "reason": "guard_blocked"})
 
-        recipient = (to_email or lead_email).strip()
-        if not recipient:
-            log_error(conn, "echo", "send_email", "LOGIC_ERROR", "No email for lead", str(lead_id))
+        missing_smtp = _missing_smtp_config_fields()
+        if missing_smtp:
+            log_error(
+                conn,
+                "echo",
+                "send_email",
+                "SMTP_NOT_CONFIGURED",
+                "SMTP configuration missing before send",
+                ",".join(missing_smtp),
+            )
             conn.commit()
-            return json.dumps({"status": "failed", "error_type": "LOGIC_ERROR", "reason": "missing_email"})
+            return json.dumps({"status": "error", "type": "SMTP_NOT_CONFIGURED"})
 
         sent_today = int(
             conn.execute(
@@ -3670,25 +4408,23 @@ async def send_outreach_email(
             conn.commit()
             return json.dumps({"status": "failed", "error_type": "RATE_LIMIT", "reason": "daily_cap"})
 
-        if smtp_credentials_available():
-            send_fn = smtp_send
-            selected_provider = "smtp"
-        elif gmail_credentials_available():
-            send_fn = gmail_api_send
-            selected_provider = "gmail_api"
+        requested_provider = (provider or "").strip().lower()
+        if requested_provider == "gmail_api":
+            if not gmail_credentials_available():
+                log_error(
+                    conn,
+                    "echo",
+                    "send_email",
+                    "AUTH_ERROR",
+                    "Gmail API credentials missing",
+                    f"requested_provider={provider}",
+                )
+                conn.commit()
+                return json.dumps({"status": "error", "type": "GMAIL_NOT_CONFIGURED"})
+            selected_provider, send_fn = "gmail_api", gmail_api_send
         else:
-            log_error(
-                conn,
-                "echo",
-                "send_email",
-                "AUTH_ERROR",
-                "No email provider credentials available",
-                f"requested_provider={provider}",
-            )
-            conn.commit()
-            return json.dumps({"status": "failed", "error_type": "AUTH_ERROR", "reason": "provider_unavailable"})
+            selected_provider, send_fn = "smtp", smtp_send
 
-        target_draft_id = draft_id if draft_id > 0 else None
         if target_draft_id is None:
             draft_row = conn.execute(
                 """
@@ -3702,10 +4438,10 @@ async def send_outreach_email(
             if draft_row:
                 target_draft_id = int(draft_row["id"])
 
-        attempts = 2
+        attempts = 1
         for attempt in range(1, attempts + 1):
             try:
-                send_fn(recipient, subject, body)
+                send_fn(recipient, normalized_subject, normalized_body)
                 now = utc_now()
                 follow_due = (
                     datetime.datetime.utcnow() + datetime.timedelta(days=3)
@@ -3732,7 +4468,7 @@ async def send_outreach_email(
                     conn.commit()
                     return json.dumps({"status": "failed", "error_type": "DB_ERROR", "reason": "email_log_write_fail"})
                 log_agent(conn, "Echo", "email_sent", f"lead_id={lead_id} provider={selected_provider}", "success")
-                increment_service_daily_usage(conn, "smtp")
+                _safe_increment_service_daily_usage(conn, selected_provider)
                 conn.commit()
                 if _notion:
                     try:
@@ -3751,8 +4487,8 @@ async def send_outreach_email(
                             _notion.sync_draft(
                                 {
                                     "saturn_id": f"draft_{lead_id}_{target_draft_id}",
-                                    "name": subject or f"Outreach to {lead_id}",
-                                    "body": body or "",
+                                    "name": normalized_subject or f"Outreach to {lead_id}",
+                                    "body": normalized_body or "",
                                     "status": "Sent",
                                     "channel": "Email",
                                     "agent": "Echo",
@@ -3765,8 +4501,14 @@ async def send_outreach_email(
                             status="Success",
                             detail=f"lead_id={lead_id} provider={selected_provider}",
                         )
-                    except Exception as _e:
-                        pass
+                    except Exception as notion_exc:
+                        _log_notion_fail_open(
+                            conn,
+                            "echo",
+                            "send_email_notion_sync",
+                            notion_exc,
+                            f"lead_id={lead_id} draft_id={target_draft_id}",
+                        )
                 return json.dumps(
                     {"status": "sent", "lead_id": lead_id, "provider": selected_provider, "attempts": attempt}
                 )
@@ -3813,8 +4555,14 @@ async def send_outreach_email(
                             ).fetchone()
                             if lead_row:
                                 _notion.sync_lead(dict(lead_row))
-                        except Exception as _e:
-                            pass
+                        except Exception as notion_exc:
+                            _log_notion_fail_open(
+                                conn,
+                                "echo",
+                                "send_email_bounce_notion_sync",
+                                notion_exc,
+                                f"lead_id={lead_id} draft_id={target_draft_id}",
+                            )
                     return json.dumps(
                         {"status": "bounced", "error_type": "API_ERROR", "reason": "bounce_detected"}
                     )
@@ -3822,17 +4570,41 @@ async def send_outreach_email(
                 if not log_email_send_attempt(conn, lead_id, target_draft_id, "failed", attempt, category, now):
                     conn.commit()
                     return json.dumps({"status": "failed", "error_type": "DB_ERROR", "reason": "email_log_write_fail"})
-                if attempt < attempts:
-                    time.sleep(5)
-                    continue
-                log_error(conn, "echo", "send_email", category, "Email send failed", str(exc)[:500])
+                if category == "RATE_LIMIT":
+                    if target_draft_id is not None:
+                        conn.execute(
+                            "UPDATE outreach_drafts SET status='pending', processed_at=NULL WHERE id=? AND lower(status)!='sent'",
+                            (target_draft_id,),
+                        )
+                    log_error(
+                        conn,
+                        "system",
+                        "rate_limit",
+                        "RATE_LIMIT",
+                        str(exc)[:500],
+                        f"service={selected_provider} lead_id={lead_id} draft_id={target_draft_id or 0}",
+                    )
+                    conn.commit()
+                    return json.dumps(
+                        {
+                            "status": "rate_limited",
+                            "message": RATE_LIMIT_MESSAGE,
+                            "retry_after": RATE_LIMIT_RETRY_AFTER,
+                        }
+                    )
+                if target_draft_id is not None:
+                    conn.execute(
+                        "UPDATE outreach_drafts SET status='pending', processed_at=NULL WHERE id=? AND lower(status)!='sent'",
+                        (target_draft_id,),
+                    )
+                log_error(conn, "echo", "send_email", "SMTP_FAILURE", "Email send failed", str(exc)[:500])
                 if category == "RATE_LIMIT":
                     if create_system_alert_once(
                         conn, "warning", "echo-email", "RATE_LIMIT", "Email provider rate limit reached"
                     ):
                         send_telegram_message("SATURN ALERT: Email provider rate limit reached.")
                 conn.commit()
-                return json.dumps({"status": "failed", "error_type": category, "reason": "send_failed"})
+                return json.dumps({"status": "error", "type": "SMTP_FAILURE"})
     except sqlite3.Error as exc:
         log_error(conn, "echo", "send_email", "DB_ERROR", "DB write fail", str(exc)[:500])
         conn.commit()
@@ -3885,8 +4657,8 @@ async def record_email_bounce(lead_id: int, reason: str = "") -> str:
                     level="Warning",
                     source="record_email_bounce",
                 )
-        except Exception as _e:
-            pass
+        except Exception as notion_exc:
+            _log_notion_fail_open(conn, "echo", "record_bounce_notion_sync", notion_exc, f"lead_id={lead_id}")
     conn.close()
     return json.dumps({"status": "ok", "lead_id": lead_id, "result": "marked_lost"})
 
@@ -4040,11 +4812,21 @@ async def send_follow_up(lead_id: int, approved: bool = False) -> str:
     follow_number = "first" if follow_count == 0 else "second"
     first_name = (str(row["name"] or "").strip().split(" ")[0] or "there")
     company = str(row["company"] or "").strip()
-    draft_text = (
-        f"Hi {first_name}, just following up on my previous message"
-        + (f" regarding {company}" if company else "")
-        + ". Happy to share next steps if helpful."
-    )
+    target_name = company or "your team"
+    draft_text = f"""Hi {first_name},
+
+Following up on my earlier note because teams usually feel the real drag once approvals, routing, and status updates at {target_name} start depending on manual follow-through across the same process.
+
+The setup I’m describing is intentionally lightweight: Python, n8n, and Notion handling the handoffs automatically so work keeps moving, follow-ups trigger on time, and nobody has to chase the next update before acting.
+
+Would a quick 15-minute call next week be useful to see whether that would reduce friction for {target_name}?"""
+    draft_subject = build_echo_subject(row["name"] or "", row["company"] or "")
+    draft_payload = compose_email_draft(draft_subject, draft_text, draft_subject)
+    if not draft_payload:
+        log_error(conn, "echo", "follow_up", "LOGIC_ERROR", "Follow-up draft formatting failed", str(lead_id))
+        conn.commit()
+        conn.close()
+        return json.dumps({"status": "failed", "error_type": "LOGIC_ERROR", "reason": "draft_format_failed"})
 
     linked_lead = conn.execute("SELECT id FROM leads WHERE id=?", (lead_id,)).fetchone()
     if not linked_lead:
@@ -4052,13 +4834,16 @@ async def send_follow_up(lead_id: int, approved: bool = False) -> str:
         conn.commit()
         conn.close()
         return json.dumps({"status": "failed", "error_type": "DB_ERROR", "reason": "linked_lead_not_found"})
+    deleted_active = delete_active_drafts_for_lead(conn, lead_id)
+    if deleted_active:
+        log_agent(conn, "Echo", "active_drafts_replaced", f"lead_id={lead_id} count={deleted_active}", "success")
 
     draft_row = conn.execute(
         """
         INSERT INTO outreach_drafts (lead_id, draft_text, status, created_at, processed_at)
         VALUES (?, ?, 'pending', ?, NULL)
         """,
-        (lead_id, draft_text, now),
+        (lead_id, draft_payload, now),
     )
     draft_id = int(draft_row.lastrowid)
     conn.execute(
@@ -4090,18 +4875,29 @@ async def send_follow_up(lead_id: int, approved: bool = False) -> str:
 @mcp.tool()
 async def process_approval_command(command: str, text: str = "") -> str:
     """Process Telegram commands over outreach_drafts with strict validation order."""
+    def _log_approval_failure(error_type: str, message: str, detail: str = "") -> None:
+        conn_log = db_conn()
+        try:
+            log_error(conn_log, "echo", "approval_command", error_type, message, detail)
+            conn_log.commit()
+        finally:
+            conn_log.close()
+
     raw = (command or "").strip()
     parts = raw.split(maxsplit=2)
     if len(parts) < 2 or not parts[0].startswith("/"):
+        _log_approval_failure("LOGIC_ERROR", "Invalid approval command", raw[:300])
         return "Invalid command"
 
     action = parts[0][1:].strip().lower()
     if action not in {"approve", "reject", "edit"}:
+        _log_approval_failure("LOGIC_ERROR", "Unsupported approval action", raw[:300])
         return "Invalid command"
 
     try:
         draft_id = int(parts[1].strip())
     except (TypeError, ValueError):
+        _log_approval_failure("LOGIC_ERROR", "Invalid draft ID", raw[:300])
         return "Invalid draft ID"
 
     conn = db_conn()
@@ -4115,11 +4911,13 @@ async def process_approval_command(command: str, text: str = "") -> str:
     ).fetchone()
     if not draft:
         conn.close()
+        _log_approval_failure("DB_ERROR", "Draft not found", str(draft_id))
         return "Draft not found"
 
     draft_status = (draft["status"] or "").strip().lower()
     if draft_status not in {"pending", "approved"}:
         conn.close()
+        _log_approval_failure("LOGIC_ERROR", "Draft already processed", f"draft_id={draft_id} status={draft_status}")
         return "Draft already processed"
 
     lead_row = conn.execute(
@@ -4128,6 +4926,7 @@ async def process_approval_command(command: str, text: str = "") -> str:
     ).fetchone()
     if not lead_row:
         conn.close()
+        _log_approval_failure("DB_ERROR", "Linked lead not found", f"draft_id={draft_id}")
         return "Linked lead not found"
 
     lead_id = int(lead_row["id"])
@@ -4136,7 +4935,7 @@ async def process_approval_command(command: str, text: str = "") -> str:
 
     if action == "approve" and draft_status == "approved":
         sent_row = conn.execute(
-            "SELECT 1 FROM email_send_log WHERE draft_id=? AND lower(status)='sent' LIMIT 1",
+            "SELECT 1 FROM email_send_log WHERE draft_id=? AND lower(status)='sent' ORDER BY id DESC LIMIT 1",
             (draft_id,),
         ).fetchone()
         if sent_row:
@@ -4182,7 +4981,18 @@ async def process_approval_command(command: str, text: str = "") -> str:
             conn2.commit()
             conn2.close()
             return f"✅ Draft {draft_id} already sent to {lead_name}"
+        if send_status == "rate_limited":
+            _log_approval_failure("RATE_LIMIT", "Approved draft send rate limited", f"draft_id={draft_id}")
+            conn_retry = db_conn()
+            conn_retry.execute(
+                "UPDATE outreach_drafts SET status='pending', processed_at=NULL WHERE id=?",
+                (draft_id,),
+            )
+            conn_retry.commit()
+            conn_retry.close()
+            return RATE_LIMIT_USER_MESSAGE
         if send_status != "sent":
+            _log_approval_failure("API_ERROR", "Approved draft send failed", f"draft_id={draft_id}")
             conn_retry = db_conn()
             conn_retry.execute(
                 "UPDATE outreach_drafts SET status='pending' WHERE id=?",
@@ -4210,8 +5020,8 @@ async def process_approval_command(command: str, text: str = "") -> str:
                         "agent": "Echo",
                     }
                 )
-            except Exception as _e:
-                pass
+            except Exception as notion_exc:
+                _log_notion_fail_open(conn2, "echo", "approval_already_sent_notion_sync", notion_exc, f"draft_id={draft_id}")
         conn2.commit()
         conn2.close()
         return f"✅ Draft {draft_id} approved and sent to {lead_name}"
@@ -4254,7 +5064,18 @@ async def process_approval_command(command: str, text: str = "") -> str:
             send_status = ""
         if send_status == "ok" and send_detail == "already_sent":
             send_status = "sent"
+        if send_status == "rate_limited":
+            _log_approval_failure("RATE_LIMIT", "Draft send rate limited after approve", f"draft_id={draft_id}")
+            conn_retry = db_conn()
+            conn_retry.execute(
+                "UPDATE outreach_drafts SET status='pending', processed_at=NULL WHERE id=?",
+                (draft_id,),
+            )
+            conn_retry.commit()
+            conn_retry.close()
+            return RATE_LIMIT_USER_MESSAGE
         if send_status != "sent":
+            _log_approval_failure("API_ERROR", "Draft send failed after approve", f"draft_id={draft_id}")
             conn_retry = db_conn()
             conn_retry.execute(
                 "UPDATE outreach_drafts SET status='pending' WHERE id=?",
@@ -4282,8 +5103,8 @@ async def process_approval_command(command: str, text: str = "") -> str:
                         "agent": "Echo",
                     }
                 )
-            except Exception as _e:
-                pass
+            except Exception as notion_exc:
+                _log_notion_fail_open(conn2, "echo", "approval_sent_notion_sync", notion_exc, f"draft_id={draft_id}")
         conn2.commit()
         conn2.close()
         return f"✅ Draft {draft_id} approved and sent to {lead_name}"
@@ -4307,8 +5128,8 @@ async def process_approval_command(command: str, text: str = "") -> str:
                         "agent": "Echo",
                     }
                 )
-            except Exception as _e:
-                pass
+            except Exception as notion_exc:
+                _log_notion_fail_open(conn, "echo", "approval_reject_notion_sync", notion_exc, f"draft_id={draft_id}")
         conn.commit()
         conn.close()
         return f"❌ Draft {draft_id} rejected"
@@ -4320,6 +5141,7 @@ async def process_approval_command(command: str, text: str = "") -> str:
         new_text = (text or "").strip()
     if not new_text:
         conn.close()
+        _log_approval_failure("LOGIC_ERROR", "Edited draft text missing", f"draft_id={draft_id}")
         return "Invalid command"
 
     conn.execute(
@@ -4339,8 +5161,8 @@ async def process_approval_command(command: str, text: str = "") -> str:
                     "agent": "Echo",
                 }
             )
-        except Exception as _e:
-            pass
+        except Exception as notion_exc:
+            _log_notion_fail_open(conn, "echo", "approval_edit_notion_sync", notion_exc, f"draft_id={draft_id}")
     conn.commit()
     conn.close()
     return f"✏️ Draft {draft_id} updated. Use /approve {draft_id} to send."
@@ -4368,8 +5190,8 @@ async def log_revenue(client: str, service: str, amount: float,
                 "source": "",
                 "notes": notes,
             })
-        except Exception as _e:
-            pass
+        except Exception as notion_exc:
+            _log_notion_fail_open(conn, "saturn", "log_revenue_notion_sync", notion_exc, client)
     conn.close()
     return f'Revenue logged: {client} | {service} | ${amount}'
 
@@ -4400,7 +5222,7 @@ def create_deal(
             """
             UPDATE leads
             SET status='qualified', updated_at=datetime('now')
-            WHERE id=? AND status IN ('new','contacted','scored')
+            WHERE id=? AND status='contacted'
             """,
             (lead_id,),
         )
@@ -4419,8 +5241,8 @@ def create_deal(
                         "notes": notes,
                     }
                 )
-            except Exception:
-                pass
+            except Exception as notion_exc:
+                _log_notion_fail_open(conn, "saturn", "create_deal_notion_sync", notion_exc, f"deal_id={deal_id}")
         return {
             "status": "success",
             "deal_id": deal_id,
@@ -4429,9 +5251,11 @@ def create_deal(
             "stage": stage,
             "lead_id": lead_id,
         }
-    except Exception as e:
+    except Exception as exc:
         conn.rollback()
-        return {"status": "error", "reason": str(e)}
+        log_error(conn, "saturn", "create_deal", "LOGIC_ERROR", "create_deal failed", str(exc)[:500])
+        conn.commit()
+        return {"status": "error", "reason": str(exc)[:300]}
     finally:
         conn.close()
 
@@ -4478,8 +5302,8 @@ def create_project(
                     "success",
                     f"Project:{title}|Client:{client_name}|Service:{service_type}",
                 )
-            except Exception:
-                pass
+            except Exception as notion_exc:
+                _log_notion_fail_open(conn, "forge", "create_project_notion_sync", notion_exc, f"deal_id={deal_id}")
         return {
             "status": "success",
             "project_id": project_id,
@@ -4488,9 +5312,11 @@ def create_project(
             "service_type": service_type,
             "deal_id": deal_id,
         }
-    except Exception as e:
+    except Exception as exc:
         conn.rollback()
-        return {"status": "error", "reason": str(e)}
+        log_error(conn, "forge", "create_project", "LOGIC_ERROR", "create_project failed", str(exc)[:500])
+        conn.commit()
+        return {"status": "error", "reason": str(exc)[:300]}
     finally:
         conn.close()
 
@@ -4520,8 +5346,8 @@ async def resolve_alert(alert_id: int) -> str:
             "resolved": 1,
         }
         await notion_sync_alert(json.dumps(alert_dict))
-    except Exception:
-        pass
+    except Exception as notion_exc:
+        _log_notion_fail_open(conn, "sentinel", "resolve_alert_notion_sync", notion_exc, f"alert_id={alert_id}")
     conn.close()
     return json.dumps({"status": "ok", "alert_id": alert_id, "resolved": True})
 
@@ -4550,8 +5376,8 @@ async def log_agent_action(agent: str, action: str, detail: str = '', result: st
                 status=result or "Success",
                 detail=detail or "",
             )
-        except Exception as _e:
-            pass
+        except Exception as notion_exc:
+            _log_notion_fail_open(conn, agent.lower(), "log_agent_action_notion_sync", notion_exc, action)
     conn.close()
     return f'Logged: {agent} | {action}'
 

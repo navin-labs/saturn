@@ -70,4 +70,4 @@ Reply /tasks to see today's work."
 send_telegram "$MSG"
 
 # Log to DB
-sqlite_exec "INSERT INTO agent_log (agent, action, detail) VALUES ('Pulse', 'morning_plan', 'Sent morning briefing')" || true
+sqlite_exec "INSERT INTO agent_log (agent, action, detail) VALUES ('Pulse', 'morning_plan', 'Sent morning briefing')"

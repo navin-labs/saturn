@@ -46,15 +46,17 @@ DEPLOY:
   systemctl --user restart saturn-api
 """
 
+import logging
 import os
 import re
-import time
-import uuid
 import sqlite3
 import requests
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+from backend.path_guard import enforce_write_path
+from configs.paths import DB_PATH
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENV LOADING
@@ -78,6 +80,13 @@ def _load_env(path: Path = _ENV_FILE) -> None:
                 os.environ[key] = val
 
 _load_env()
+
+logger = logging.getLogger("saturn.notion_sync")
+
+
+def _print_runtime_error(action: str, message: str, detail: str = "") -> None:
+    suffix = f" detail={detail[:180]}" if detail else ""
+    logger.warning("[Saturn] %s failed: %s%s", action, str(message)[:240], suffix)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -296,11 +305,11 @@ DEFAULT_STAGE_PROB: dict[str, float] = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NotionAPIError(RuntimeError):
-    """Raised when all retries are exhausted. Carry `reason` for Sentinel routing."""
+    """Raised when a Notion API call must fail fast. Carry `reason` for routing."""
     def __init__(self, reason: str, original: Exception):
         self.reason   = reason
         self.original = original
-        super().__init__(f"Notion API failure after retries: {reason}")
+        super().__init__(f"Notion API failure: {reason}")
         self.__cause__ = original
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -308,26 +317,15 @@ class NotionAPIError(RuntimeError):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def safe_request(func, *args, **kwargs):
-    """Exponential backoff: HTTP 429, ConnectionError, Timeout. 3 attempts: 1s→2s→4s."""
-    last_exc    = None
-    last_reason = "unknown"
-    for attempt in range(3):
-        try:
-            return func(*args, **kwargs)
-        except (requests.HTTPError, requests.ConnectionError, requests.Timeout) as e:
-            retriable = (
-                isinstance(e, (requests.ConnectionError, requests.Timeout))
-                or (isinstance(e, requests.HTTPError) and e.response.status_code == 429)
-            )
-            if retriable:
-                last_exc    = e
-                last_reason = "rate limited" if isinstance(e, requests.HTTPError) else "network error"
-                wait        = 2 ** attempt
-                print(f"[Saturn] {last_reason} — retry in {wait}s ({attempt + 1}/3)")
-                time.sleep(wait)
-            else:
-                raise
-    raise NotionAPIError(last_reason, last_exc)
+    """Single-attempt wrapper. Never sleep or retry on rate limit."""
+    try:
+        return func(*args, **kwargs)
+    except requests.HTTPError as exc:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code == 429:
+            raise NotionAPIError("rate limited", exc)
+        raise
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHEMA VALIDATION
@@ -429,8 +427,9 @@ class NotionClient:
             return {}
         try:
             return safe_request(_call)
-        except Exception:
-            return {}
+        except Exception as exc:
+            _print_runtime_error("notion_delete_block", str(exc), block_id)
+            return {"status": "error", "error": "API_ERROR", "detail": str(exc)}
 
     def append_block_children(self, page_id: str, children: list) -> dict:
         return self._patch(
@@ -449,13 +448,13 @@ def _text(text: str) -> dict:
     return {"rich_text": [{"text": {"content": str(text)[:2000]}}]}
 
 def _select(name: str) -> dict:
-    return {"select": {"name": name}}
+    return {"select": {"name": (str(name or "Unknown").strip() or "Unknown")[:100]}}
 
 def _multi_select(names: list[str]) -> dict:
     return {"multi_select": [{"name": n} for n in names]}
 
 def _number(val: float) -> dict:
-    return {"number": val}
+    return {"number": float(val)}
 
 def _checkbox(val: bool) -> dict:
     return {"checkbox": bool(val)}
@@ -465,10 +464,10 @@ def _date(dt: str) -> dict:
     return {"date": {"start": dt}}
 
 def _url(val: str) -> dict:
-    return {"url": val}
+    return {"url": str(val)}
 
 def _email(val: str) -> dict:
-    return {"email": val}
+    return {"email": str(val).strip()}
 
 def _saturn_id(sid: str) -> dict:
     return {"rich_text": [{"text": {"content": sid}}]}
@@ -483,9 +482,15 @@ def _today_iso() -> str:
 
 def _make_sid(prefix: str) -> str:
     tz_ist = timezone(timedelta(hours=5, minutes=30))
-    ts  = datetime.now(tz_ist).strftime("%Y%m%d%H%M%S%f")
-    uid = uuid.uuid4().hex[:6]
-    return f"{prefix}_{ts}_{uid}"
+    ts = datetime.now(tz_ist).strftime("%Y%m%d%H%M%S%f")
+    safe_prefix = re.sub(r"[^a-z0-9_]+", "_", str(prefix or "row").strip().lower()).strip("_") or "row"
+    return f"{safe_prefix}_{ts}"
+
+
+def _deterministic_run_id(agent: str, started_at: int, attempt: int = 0) -> str:
+    safe_agent = re.sub(r"[^a-z0-9_]+", "_", str(agent or "saturn").strip().lower()).strip("_") or "saturn"
+    base = f"run_{safe_agent}_{int(started_at)}"
+    return base if attempt <= 0 else f"{base}_{attempt + 1}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN SYNC CLASS
@@ -506,10 +511,8 @@ class NotionSync:
                 "Set it in ~/.config/openclaw-secrets/telegram.env"
             )
         self.client      = NotionClient(api_key)
-        self.sqlite_path = sqlite_path or os.environ.get(
-            "SATURN_DB_PATH",
-            str(Path.home() / "Workspace" / "Saturn" / "database" / "saturn.db")
-        )
+        sqlite_target = sqlite_path or os.environ.get("SATURN_DB_PATH", str(DB_PATH))
+        self.sqlite_path = str(enforce_write_path(sqlite_target, "notion-sync-db"))
         self._daily_cost_cache: float = 0.0
         self._daily_cost_date:  str   = ""
         self._init_sqlite()
@@ -518,6 +521,7 @@ class NotionSync:
     # ── SQLITE SETUP ──────────────────────────────────────────────────────────
 
     def _conn(self) -> sqlite3.Connection:
+        Path(self.sqlite_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(
             self.sqlite_path,
             timeout=30,
@@ -574,7 +578,7 @@ class NotionSync:
                 (DATABASE_VERSION,)
             )
             conn.commit()
-            print(f"[Saturn] Registry version migrated: {row[0]} → {DATABASE_VERSION}")
+            logger.info("[Saturn] Registry version migrated: %s -> %s", row[0], DATABASE_VERSION)
         conn.close()
 
     def _log_sync_error(self, action: str, error_type: str, message: str, detail: str = "") -> None:
@@ -595,8 +599,13 @@ class NotionSync:
                 ("notion_sync", action, error_type, str(message)[:300], str(detail)[:500], _now_iso()),
             )
             conn.commit()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "[Saturn] notion_sync log failure: action=%s message=%s error=%s",
+                action,
+                str(message)[:120],
+                exc,
+            )
         finally:
             if conn is not None:
                 conn.close()
@@ -653,6 +662,7 @@ class NotionSync:
         Returns (notion_page, saturn_id).
         """
         try:
+            saturn_id = str(saturn_id or _make_sid(db_name.rstrip("s") or "row")).strip() or _make_sid("row")
             validate_properties(db_name, properties)
 
             existing = self._get_notion_page_id(saturn_id)
@@ -676,8 +686,8 @@ class NotionSync:
                 self.log_agent_activity(
                     "Saturn", f"{action} {db_name}", saturn_id, "Success"
                 )
-            except Exception:
-                pass  # audit log never blocks primary write
+            except Exception as exc:
+                self._log_sync_error("upsert_audit", "API_ERROR", str(exc), f"{db_name}:{saturn_id}")
 
             return result, saturn_id
         except Exception as exc:
@@ -689,19 +699,19 @@ class NotionSync:
         """Ping Notion. Raises Critical Sentinel alert on failure."""
         try:
             self.get_all("leads")
-            print("[Saturn] ✓ Notion connectivity OK")
+            logger.info("[Saturn] Notion connectivity OK")
             return True
         except Exception as e:
             self._log_sync_error("health_check", "API_ERROR", str(e), "leads")
-            print(f"[Saturn] ✗ Notion unreachable: {e}")
+            logger.warning("[Saturn] Notion unreachable: %s", e)
             try:
                 self.raise_alert(
                     "Sentinel", "Notion Sync Failure",
                     f"Saturn cannot reach Notion API: {e}",
                     level="Critical", source="health_check()"
                 )
-            except Exception:
-                pass
+            except Exception as alert_exc:
+                self._log_sync_error("health_check_alert", "API_ERROR", str(alert_exc), "health_check()")
             return False
 
     # ── EXECUTION LOCK ────────────────────────────────────────────────────────
@@ -719,11 +729,11 @@ class NotionSync:
             )
             conn.commit()
             conn.close()
-            print(f"[Saturn] ✓ Lock acquired: {agent}")
+            logger.info("[Saturn] Lock acquired: %s", agent)
             return True
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as exc:
             conn.close()
-            print(f"[Saturn] ✗ Lock denied: {agent} is already running")
+            logger.warning("[Saturn] Lock denied: %s is already running (%s)", agent, exc)
             return False
 
     def release_lock(self, agent: str):
@@ -731,32 +741,39 @@ class NotionSync:
         conn.execute("DELETE FROM agent_lock WHERE agent = ?", (agent,))
         conn.commit()
         conn.close()
-        print(f"[Saturn] Lock released: {agent}")
+        logger.info("[Saturn] Lock released: %s", agent)
 
     # ── AGENT RUN LOG ─────────────────────────────────────────────────────────
 
     def start_run(self, agent: str, run_id: str = None) -> str:
-        if run_id is None:
-            run_id = f"run_{agent}_{int(datetime.now(timezone(timedelta(hours=5, minutes=30))).timestamp())}_{uuid.uuid4().hex[:6]}"
         now_ts = int(datetime.now(timezone(timedelta(hours=5, minutes=30))).timestamp())
         conn   = self._conn()
+        base_run_id = str(run_id or "").strip()
+        active_run_id = base_run_id or _deterministic_run_id(agent, now_ts, 0)
         for attempt in range(3):
             try:
                 conn.execute(
                     "INSERT INTO agent_runs (run_id, agent, started_at, ended_at, status) "
                     "VALUES (?,?,?,NULL,'running')",
-                    (run_id, agent, now_ts)
+                    (active_run_id, agent, now_ts)
                 )
                 conn.commit()
                 break
-            except sqlite3.IntegrityError:
+            except sqlite3.IntegrityError as exc:
+                logger.warning(
+                    "[Saturn] start_run collision: agent=%s run_id=%s attempt=%s error=%s",
+                    agent,
+                    active_run_id,
+                    attempt + 1,
+                    exc,
+                )
                 if attempt == 2:
                     conn.close()
                     raise RuntimeError(f"[Saturn] start_run failed for {agent} after 3 attempts")
-                run_id = f"run_{agent}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+                active_run_id = _deterministic_run_id(agent, now_ts, attempt + 1)
         conn.close()
-        print(f"[Saturn] ▶ Run started: {agent} [{run_id}]")
-        return run_id
+        logger.info("[Saturn] Run started: %s [%s]", agent, active_run_id)
+        return active_run_id
 
     def end_run(self, run_id: str, status: str = "success") -> float:
         now_ts = int(datetime.now(timezone(timedelta(hours=5, minutes=30))).timestamp())
@@ -771,22 +788,27 @@ class NotionSync:
         ).fetchone()
         conn.close()
         duration = float(now_ts - row[0]) if row else 0.0
-        print(f"[Saturn] ■ Run ended: [{run_id}] status={status} duration={duration:.1f}s")
+        logger.info("[Saturn] Run ended: [%s] status=%s duration=%.1fs", run_id, status, duration)
         return duration
 
     def get_run_history(self, agent: str = None, limit: int = 50) -> list[dict]:
+        try:
+            safe_limit = max(1, min(int(limit or 50), 500))
+        except (TypeError, ValueError) as exc:
+            logger.warning("[Saturn] invalid run history limit %r: %s", limit, exc)
+            safe_limit = 50
         conn = self._conn()
         if agent:
             rows = conn.execute(
                 "SELECT run_id, agent, started_at, ended_at, status "
                 "FROM agent_runs WHERE agent = ? ORDER BY started_at DESC LIMIT ?",
-                (agent, limit)
+                (agent, safe_limit)
             ).fetchall()
         else:
             rows = conn.execute(
                 "SELECT run_id, agent, started_at, ended_at, status "
                 "FROM agent_runs ORDER BY started_at DESC LIMIT ?",
-                (limit,)
+                (safe_limit,)
             ).fetchall()
         conn.close()
         return [
@@ -820,7 +842,8 @@ class NotionSync:
                 self._daily_cost_cache = total_cost
                 self._daily_cost_date  = today
             except Exception as e:
-                print(f"[Saturn] Budget check error (non-blocking): {e}")
+                self._log_sync_error("check_budget", "API_ERROR", str(e), "token_usage")
+                logger.warning("[Saturn] Budget check error (non-blocking): %s", e)
                 return True
 
         if total_cost >= MAX_DAILY_TOKEN_COST:
@@ -830,12 +853,12 @@ class NotionSync:
                     f"Cost ${total_cost:.2f} exceeds ${MAX_DAILY_TOKEN_COST:.2f} daily limit.",
                     level="Critical", source="check_budget()"
                 )
-            except Exception:
-                pass
-            print(f"[Saturn] ⚠ BUDGET EXCEEDED: ${total_cost:.2f} / ${MAX_DAILY_TOKEN_COST:.2f}")
+            except Exception as alert_exc:
+                self._log_sync_error("check_budget_alert", "API_ERROR", str(alert_exc), "check_budget()")
+            logger.warning("[Saturn] BUDGET EXCEEDED: $%.2f / $%.2f", total_cost, MAX_DAILY_TOKEN_COST)
             return False
 
-        print(f"[Saturn] ✓ Budget OK: ${total_cost:.2f} / ${MAX_DAILY_TOKEN_COST:.2f}")
+        logger.info("[Saturn] Budget OK: $%.2f / $%.2f", total_cost, MAX_DAILY_TOKEN_COST)
         return True
 
     # ── HIGH-LEVEL ENTITY SYNC METHODS ────────────────────────────────
@@ -850,28 +873,28 @@ class NotionSync:
             row = dict(cursor.fetchone())
             sync.sync_lead(row)
         """
-        sid = lead.get("saturn_id") or _make_sid("lead")
-        name = lead.get("name") or lead.get("company") or "Unnamed Lead"
+        sid = str(lead.get("saturn_id") or _make_sid("lead")).strip() or _make_sid("lead")
+        name = str(lead.get("name") or lead.get("company") or "Unnamed Lead").strip() or "Unnamed Lead"
         props: dict = {
             "Name":    _title(name),
         }
-        if lead.get("company"):      props["Company"]      = _text(lead["company"])
-        if lead.get("contact"):      props["Contact Name"] = _text(lead["contact"])
-        if lead.get("email"):        props["Email"]        = _email(lead["email"])
-        if lead.get("website"):      props["Website"]      = _url(lead["website"])
-        if lead.get("linkedin"):     props["LinkedIn"]     = _url(lead["linkedin"])
-        if lead.get("industry"):     props["Industry"]     = _text(lead["industry"])
-        if lead.get("source"):       props["Source"]       = _select(lead["source"].capitalize())
-        if lead.get("status"):       props["Status"]       = _select(lead["status"].capitalize())
+        if lead.get("company"):      props["Company"]      = _text(str(lead["company"]))
+        if lead.get("contact"):      props["Contact Name"] = _text(str(lead["contact"]))
+        if lead.get("email"):        props["Email"]        = _email(str(lead["email"]).strip())
+        if lead.get("website"):      props["Website"]      = _url(str(lead["website"]).strip())
+        if lead.get("linkedin"):     props["LinkedIn"]     = _url(str(lead["linkedin"]).strip())
+        if lead.get("industry"):     props["Industry"]     = _text(str(lead["industry"]))
+        if lead.get("source"):       props["Source"]       = _select(str(lead["source"]).strip().capitalize())
+        if lead.get("status"):       props["Status"]       = _select(str(lead["status"]).strip().capitalize())
         if lead.get("lead_score") is not None:
             props["Lead Score"] = _number(float(lead["lead_score"]))
-        if lead.get("email_status"): props["Email Status"] = _select(lead["email_status"])
+        if lead.get("email_status"): props["Email Status"] = _select(str(lead["email_status"]).strip())
         if lead.get("follow_up_count") is not None:
             props["Follow Up Count"] = _number(int(lead["follow_up_count"]))
         if lead.get("follow_up_due_at"):
-            props["Follow Up Due"] = _date(lead["follow_up_due_at"][:10])
+            props["Follow Up Due"] = _date(str(lead["follow_up_due_at"])[:10])
         if lead.get("last_outreach_at"):
-            props["Last Outreach"] = _date(lead["last_outreach_at"][:10])
+            props["Last Outreach"] = _date(str(lead["last_outreach_at"])[:10])
         return self.upsert("leads", sid, props)
 
     def sync_revenue(self, rev: dict) -> tuple[dict, str]:
@@ -879,25 +902,26 @@ class NotionSync:
         Sync a SQLite `revenue` row to Notion.
         rev: dict with keys matching SQLite revenue table columns.
         """
-        sid = rev.get("saturn_id") or _make_sid("rev")
-        client_label = rev.get("client") or "Unknown"
-        entry_label  = f"{client_label} — {rev.get('service', '')}"
+        sid = str(rev.get("saturn_id") or _make_sid("rev")).strip() or _make_sid("rev")
+        client_label = str(rev.get("client") or "Unknown").strip() or "Unknown"
+        service_label = str(rev.get("service") or "").strip()
+        entry_label  = f"{client_label} — {service_label}"
         props: dict  = {
             "Revenue Entry": _title(entry_label),
         }
         if rev.get("amount") is not None: props["Amount"]  = _number(float(rev["amount"]))
-        if rev.get("service"):            props["Service"] = _text(rev["service"])
-        if rev.get("status"):             props["Status"]  = _select(rev["status"].capitalize())
-        if rev.get("source"):             props["Source"]  = _select(rev["source"].capitalize())
-        if rev.get("invoice_date"):       props["Invoice Date"] = _date(rev["invoice_date"][:10])
-        if rev.get("paid_date"):          props["Paid Date"]    = _date(rev["paid_date"][:10])
+        if service_label:                 props["Service"] = _text(service_label)
+        if rev.get("status"):             props["Status"]  = _select(str(rev["status"]).strip().capitalize())
+        if rev.get("source"):             props["Source"]  = _select(str(rev["source"]).strip().capitalize())
+        if rev.get("invoice_date"):       props["Invoice Date"] = _date(str(rev["invoice_date"])[:10])
+        if rev.get("paid_date"):          props["Paid Date"]    = _date(str(rev["paid_date"])[:10])
         return self.upsert("revenue", sid, props)
 
     def sync_task(self, task: dict) -> tuple[dict, str]:
         # Notion sync is direct API only. No LLM tokens are consumed here.
         """Sync a SQLite `tasks` row to Notion."""
-        sid   = task.get("saturn_id") or _make_sid("task")
-        props = {"Task Name": _title(task.get("task") or task.get("name") or "Untitled")}
+        sid   = str(task.get("saturn_id") or _make_sid("task")).strip() or _make_sid("task")
+        props = {"Task Name": _title(str(task.get("task") or task.get("name") or "Untitled"))}
         priority_value = str(task.get("priority") or "").strip().lower()
         priority_map = {
             "low": "Low",
@@ -929,15 +953,15 @@ class NotionSync:
 
     def sync_draft(self, draft: dict) -> tuple[dict, str]:
         """Sync a SQLite `outreach_drafts` / `content_queue` row to Notion."""
-        sid   = draft.get("saturn_id") or _make_sid("draft")
+        sid   = str(draft.get("saturn_id") or _make_sid("draft")).strip() or _make_sid("draft")
         props = {
-            "Draft Name": _title(draft.get("subject") or draft.get("name") or "Draft"),
+            "Draft Name": _title(str(draft.get("subject") or draft.get("name") or "Draft")),
         }
         if draft.get("body") or draft.get("draft_text"):
-            props["Draft Text"] = _text(draft.get("body") or draft.get("draft_text", ""))
-        if draft.get("status"):  props["Status"]  = _select(draft["status"].replace("_", " ").title())
-        if draft.get("channel"): props["Channel"] = _select(draft["channel"].capitalize())
-        if draft.get("agent"):   props["Agent"]   = _select(draft["agent"])
+            props["Draft Text"] = _text(str(draft.get("body") or draft.get("draft_text", "")))
+        if draft.get("status"):  props["Status"]  = _select(str(draft["status"]).replace("_", " ").title())
+        if draft.get("channel"): props["Channel"] = _select(str(draft["channel"]).strip().capitalize())
+        if draft.get("agent"):   props["Agent"]   = _select(str(draft["agent"]).strip())
         approved = draft.get("approved")
         if approved is not None: props["Approved"] = _checkbox(bool(approved))
         return self.upsert("outreach_drafts", sid, props)
@@ -968,13 +992,13 @@ class NotionSync:
         sid = _make_sid("act")
         try:
             result = self.client.create_page(DATABASES["agent_activity"]["database_id"], {
-                "Activity":       _title(f"{agent}: {action}"),
-                "Agent":          _select(agent),
-                "Action":         _text(action),
-                "Target":         _text(target),
-                "Status":         _select(status),
-                "Execution Time": _number(execution_time),
-                "Detail":         _text(detail),
+                "Activity":       _title(f"{str(agent).strip()}: {str(action).strip()}"),
+                "Agent":          _select(str(agent).strip() or "Saturn"),
+                "Action":         _text(str(action)),
+                "Target":         _text(str(target)),
+                "Status":         _select(str(status).strip() or "Success"),
+                "Execution Time": _number(float(execution_time or 0.0)),
+                "Detail":         _text(str(detail)),
                 "Timestamp":      _date(_now_iso()),
                 "Saturn ID":      _saturn_id(sid),
             })
@@ -993,7 +1017,8 @@ class NotionSync:
                     {"timestamp": "created_time", "created_time": {"on_or_after": today}},
                 ]
             })
-        except Exception:
+        except Exception as exc:
+            self._log_sync_error("find_existing_alert", "API_ERROR", str(exc), f"{agent}:{title}")
             return None
 
         normalized_title = str(title or "").strip().lower()
@@ -1021,11 +1046,11 @@ class NotionSync:
                     "page_id": existing.get("id", ""),
                 }
             result = self.client.create_page(DATABASES["alerts"]["database_id"], {
-                "Alert Title":     _title(title),
-                "Level":           _select(level),
-                "Agent":           _select(agent),
-                "Source":          _text(source),
-                "Message":         _text(message),
+                "Alert Title":     _title(str(title) or "Untitled Alert"),
+                "Level":           _select(str(level).strip() or "Warning"),
+                "Agent":           _select(str(agent).strip() or "Saturn"),
+                "Source":          _text(str(source)),
+                "Message":         _text(str(message)),
                 "Resolved":        _checkbox(False),   # bool, not string
                 "Saturn ID":       _saturn_id(sid),
             })
@@ -1040,12 +1065,12 @@ class NotionSync:
         sid    = _make_sid("tok")
         try:
             result = self.client.create_page(DATABASES["token_usage"]["database_id"], {
-                "Log Entry": _title(f"{agent} / {model}"),
-                "Agent":     _select(agent),
-                "Model":     _text(model),
-                "Action":    _text(action),
-                "Tokens":    _number(tokens),
-                "Cost":      _number(cost),
+                "Log Entry": _title(f"{str(agent).strip()} / {str(model).strip()}"),
+                "Agent":     _select(str(agent).strip() or "Saturn"),
+                "Model":     _text(str(model)),
+                "Action":    _text(str(action)),
+                "Tokens":    _number(max(0, int(tokens))),
+                "Cost":      _number(max(0.0, float(cost))),
                 "Logged At": _date(_now_iso()),
                 "Saturn ID": _saturn_id(sid),
             })
@@ -1120,11 +1145,11 @@ class NotionSync:
             else:
                 # Prepend callout if not found
                 self.client.append_block_children(HQ_PAGE_ID, [callout_block])
-            print(f"[Saturn] ✓ HQ status updated: {status_text}")
+            logger.info("[Saturn] HQ status updated: %s", status_text)
             return True
         except Exception as e:
             self._log_sync_error("notion_update_hq_status", "API_ERROR", str(e), status_text)
-            print(f"[Saturn] ✗ HQ status update failed: {e}")
+            logger.warning("[Saturn] HQ status update failed: %s", e)
             return False
 
     # ── FLOWCRAFT OS REVENUE TRACKER UPDATE ───────────────────────────
@@ -1171,13 +1196,13 @@ class NotionSync:
                         }
                     }
                 )
-                print(f"[Saturn] ✓ OS revenue updated: {month} → ${earned:,.0f}")
+                logger.info("[Saturn] OS revenue updated: %s -> $%s", month, format(earned, ",.0f"))
                 return True
-            print(f"[Saturn] OS revenue: month '{month}' not found in table")
+            logger.warning("[Saturn] OS revenue month not found in table: %s", month)
             return False
         except Exception as e:
             self._log_sync_error("notion_update_os_revenue", "API_ERROR", str(e), month)
-            print(f"[Saturn] ✗ OS revenue update failed: {e}")
+            logger.warning("[Saturn] OS revenue update failed: %s", e)
             return False
 
     # ── PROGRESS REPORT ───────────────────────────────────────────────
@@ -1218,6 +1243,7 @@ class NotionSync:
                 "high_score": high_score,
             }
         except Exception as e:
+            self._log_sync_error("progress_report", "API_ERROR", str(e), "leads")
             report["leads"] = {"error": str(e)}
 
         # Pipeline (deals)
@@ -1225,6 +1251,7 @@ class NotionSync:
             pipeline = self.get_pipeline_value()
             report["pipeline"] = pipeline
         except Exception as e:
+            self._log_sync_error("progress_report", "API_ERROR", str(e), "pipeline")
             report["pipeline"] = {"error": str(e)}
 
         # Outreach
@@ -1238,6 +1265,7 @@ class NotionSync:
                 "follow_up_due":    len(follow_up),
             }
         except Exception as e:
+            self._log_sync_error("progress_report", "API_ERROR", str(e), "outreach")
             report["outreach"] = {"error": str(e)}
 
         # Revenue
@@ -1264,6 +1292,7 @@ class NotionSync:
                 "this_month":  round(this_month, 2),
             }
         except Exception as e:
+            self._log_sync_error("progress_report", "API_ERROR", str(e), "revenue")
             report["revenue"] = {"error": str(e)}
 
         # Tasks
@@ -1277,6 +1306,7 @@ class NotionSync:
                 "overdue": len(overdue),
             }
         except Exception as e:
+            self._log_sync_error("progress_report", "API_ERROR", str(e), "tasks")
             report["tasks"] = {"error": str(e)}
 
         # Alerts
@@ -1290,6 +1320,7 @@ class NotionSync:
                 "unresolved": len(unresolved),
             }
         except Exception as e:
+            self._log_sync_error("progress_report", "API_ERROR", str(e), "alerts")
             report["alerts"] = {"error": str(e)}
 
         return report
@@ -1418,25 +1449,27 @@ class NotionSync:
         total  = len(dbs)
         ok     = 0
         errors = []
-        print(f"\n[Saturn] Pulling {total} Notion databases...")
-        print("─" * 50)
+        logger.info("[Saturn] Pulling %s Notion databases", total)
         for i, db_name in enumerate(dbs, 1):
             pct = int((i / total) * 100)
-            bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
             try:
                 records = self.get_all(db_name)
                 for r in records:
                     rt = r.get("properties", {}).get("Saturn ID", {}).get("rich_text", [])
                     if rt:
                         self._register(rt[0]["text"]["content"], r["id"], db_name)
-                print(f"  [{bar}] {pct:3d}% {db_name:25s} ✓ {len(records)} records")
+                logger.info("[Saturn] pull_all progress=%s%% db=%s records=%s", pct, db_name, len(records))
                 ok += 1
             except Exception as e:
-                print(f"  [{bar}] {pct:3d}% {db_name:25s} ✗ {e}")
+                self._log_sync_error("pull_all", "API_ERROR", str(e), db_name)
+                logger.warning("[Saturn] pull_all db=%s progress=%s%% failed: %s", db_name, pct, e)
                 errors.append((db_name, str(e)))
-        print("─" * 50)
-        print(f"[Saturn] Pull complete: {ok}/{total} OK" +
-              (f", {len(errors)} errors" if errors else ""))
+        logger.info(
+            "[Saturn] Pull complete: %s/%s OK%s",
+            ok,
+            total,
+            f", {len(errors)} errors" if errors else "",
+        )
         return {"ok": ok, "total": total, "errors": errors}
 
 

@@ -5,6 +5,10 @@ Used by: Hunter (scoring), Echo (messages)
 No external dependencies.
 """
 
+import logging
+
+logger = logging.getLogger("saturn.skill_linkedin")
+
 
 def connection_request_prompt(sender: str, contact: str, role: str, company: str, reason: str) -> str:
     return (
@@ -68,4 +72,5 @@ def parse_score(llm_output: str) -> dict:
             "angle": data.get("angle", ""),
         }
     except Exception as e:
+        logger.warning("skill_linkedin parse_score failed", exc_info=e)
         return {"status": "parse_error", "reason": str(e), "raw": llm_output[:200]}

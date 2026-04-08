@@ -68,4 +68,4 @@ Evening report will follow at 22:00."
 send_telegram "$MSG"
 
 # Log to DB for audit trail
-sqlite_exec "INSERT INTO agent_log (agent, action, detail) VALUES ('Pulse', 'progress_review', 'Sent 18:00 review')" || true
+sqlite_exec "INSERT INTO agent_log (agent, action, detail) VALUES ('Pulse', 'progress_review', 'Sent 18:00 review')"

@@ -5,8 +5,10 @@ Used by: Forge
 All methods return dict — never raise. Fail-open design.
 """
 
+import logging
 import os
 
+logger = logging.getLogger("saturn.skill_n8n")
 
 def _base():
     return os.environ.get("N8N_BASE_URL", "http://localhost:5678")
@@ -28,6 +30,7 @@ def _get(path: str, timeout: int = 10) -> dict:
         r.raise_for_status()
         return {"status": "success", "data": r.json()}
     except Exception as e:
+        logger.warning("skill_n8n GET failed for %s", path, exc_info=e)
         return {"status": "error", "reason": str(e)}
 
 
@@ -44,6 +47,7 @@ def _post(path: str, body: dict = None, timeout: int = 15) -> dict:
         r.raise_for_status()
         return {"status": "success", "data": r.json()}
     except Exception as e:
+        logger.warning("skill_n8n POST failed for %s", path, exc_info=e)
         return {"status": "error", "reason": str(e)}
 
 
@@ -55,6 +59,7 @@ def _delete(path: str, timeout: int = 10) -> dict:
         r.raise_for_status()
         return {"status": "success"}
     except Exception as e:
+        logger.warning("skill_n8n DELETE failed for %s", path, exc_info=e)
         return {"status": "error", "reason": str(e)}
 
 
@@ -65,6 +70,7 @@ def n8n_health() -> dict:
         r = requests.get(f"{_base()}/healthz", timeout=5)
         return {"status": "ok" if r.status_code == 200 else "degraded", "code": r.status_code}
     except Exception as e:
+        logger.warning("skill_n8n health check failed", exc_info=e)
         return {"status": "unreachable", "reason": str(e)}
 
 
@@ -103,7 +109,14 @@ def n8n_deploy(workflow_dict: dict, activate: bool = False) -> dict:
     data = result.get("data")
     wf_id = data.get("id") if isinstance(data, dict) else None
     if activate and wf_id:
-        n8n_activate(str(wf_id), True)
+        activation = n8n_activate(str(wf_id), True)
+        if activation.get("status") != "success":
+            return {
+                "status": "error",
+                "reason": "workflow_created_but_activation_failed",
+                "workflow_id": wf_id,
+                "detail": activation,
+            }
     return {
         "status": "success",
         "workflow_id": wf_id,

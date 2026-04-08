@@ -58,11 +58,11 @@ sqlite_exec_allow_duplicate() {
 require_base_path "$DB_PATH" "sqlite-db-write"
 
 # Ensure quota-monitor columns exist (safe no-op if already present)
-sqlite_exec_allow_duplicate "ALTER TABLE api_usage_log ADD COLUMN service TEXT;" || true
-sqlite_exec_allow_duplicate "ALTER TABLE api_usage_log ADD COLUMN usage_date TEXT;" || true
-sqlite_exec_allow_duplicate "ALTER TABLE api_usage_log ADD COLUMN call_count INTEGER DEFAULT 0;" || true
-sqlite_exec_allow_duplicate "ALTER TABLE api_usage_log ADD COLUMN quota_limit INTEGER DEFAULT 0;" || true
-sqlite_exec_allow_duplicate "ALTER TABLE api_usage_log ADD COLUMN paused INTEGER DEFAULT 0;" || true
+sqlite_exec_allow_duplicate "ALTER TABLE api_usage_log ADD COLUMN service TEXT;"
+sqlite_exec_allow_duplicate "ALTER TABLE api_usage_log ADD COLUMN usage_date TEXT;"
+sqlite_exec_allow_duplicate "ALTER TABLE api_usage_log ADD COLUMN call_count INTEGER DEFAULT 0;"
+sqlite_exec_allow_duplicate "ALTER TABLE api_usage_log ADD COLUMN quota_limit INTEGER DEFAULT 0;"
+sqlite_exec_allow_duplicate "ALTER TABLE api_usage_log ADD COLUMN paused INTEGER DEFAULT 0;"
 
 HUNTER_QUOTA=${SATURN_HUNTER_API_DAILY_LIMIT:-10}
 SMTP_QUOTA=${SATURN_SMTP_DAILY_LIMIT:-10}
@@ -70,7 +70,7 @@ GEMINI_QUOTA=${SATURN_GEMINI_API_DAILY_LIMIT:-1000}
 
 # New day auto-resume: clear pause flags, keep call_count for audit.
 sqlite_exec \
-  "UPDATE api_usage_log SET paused=0 WHERE COALESCE(paused,0)=1 AND usage_date IS NOT NULL AND usage_date < date('now');" || true
+  "UPDATE api_usage_log SET paused=0 WHERE COALESCE(paused,0)=1 AND usage_date IS NOT NULL AND usage_date < date('now');"
 
 check_service_quota() {
   local service="$1"
@@ -83,13 +83,13 @@ check_service_quota() {
 
   sqlite_exec \
     "INSERT OR IGNORE INTO api_usage_log (agent, provider, endpoint, status, error_type, detail, called_at, service, usage_date, call_count, quota_limit, paused) \
-     VALUES ('system','$service','daily_counter','success','','',CURRENT_TIMESTAMP,'$service',date('now'),0,$quota,0);" || true
+     VALUES ('system','$service','daily_counter','success','','',CURRENT_TIMESTAMP,'$service',date('now'),0,$quota,0);"
   sqlite_exec \
-    "UPDATE api_usage_log SET quota_limit=$quota WHERE service='$service' AND usage_date=date('now') AND endpoint='daily_counter' AND COALESCE(quota_limit,0)<=0;" || true
+    "UPDATE api_usage_log SET quota_limit=$quota WHERE service='$service' AND usage_date=date('now') AND endpoint='daily_counter' AND COALESCE(quota_limit,0)<=0;"
 
   details=$(sqlite_query \
     "SELECT COALESCE(call_count,0) || '|' || COALESCE(quota_limit,$quota) || '|' || COALESCE(paused,0) \
-     FROM api_usage_log WHERE service='$service' AND usage_date=date('now') AND endpoint='daily_counter' LIMIT 1;" \
+     FROM api_usage_log WHERE service='$service' AND usage_date=date('now') AND endpoint='daily_counter' ORDER BY id DESC LIMIT 1;" \
     "0|$quota|0")
   call_count="${details%%|*}"
   details="${details#*|}"
@@ -105,7 +105,7 @@ check_service_quota() {
   pct=$(( (call_count * 100) / quota_limit ))
   if [ "$pct" -ge 80 ] && [ "$paused" -eq 0 ]; then
     sqlite_exec \
-      "UPDATE api_usage_log SET paused=1 WHERE service='$service' AND usage_date=date('now') AND endpoint='daily_counter';" || true
+      "UPDATE api_usage_log SET paused=1 WHERE service='$service' AND usage_date=date('now') AND endpoint='daily_counter';"
     send_telegram "⚠️ ${service} quota at ${pct}%. Pausing until tomorrow."
   fi
 }
@@ -131,4 +131,4 @@ fi
 
 # Log hourly check
 DONE=$(sqlite_query 'SELECT COUNT(*) FROM tasks WHERE status="done" AND date(updated_at)=date("now")' 0)
-sqlite_exec "INSERT INTO hourly_checks (summary, open_tasks, completed_today) VALUES ('hourly', $HIGH, $DONE)" || true
+sqlite_exec "INSERT INTO hourly_checks (summary, open_tasks, completed_today) VALUES ('hourly', $HIGH, $DONE)"

@@ -5,10 +5,12 @@ Used by: Pulse, Sentinel
 Requires: token_log table in SQLite (skips gracefully if missing).
 """
 
+import logging
 import os
 import sqlite3
 from pathlib import Path
 
+logger = logging.getLogger("saturn.skill_cost_monitor")
 _DB = os.environ.get(
     "SATURN_DB_PATH",
     str(Path.home() / "Workspace" / "Saturn" / "database" / "saturn.db"),
@@ -56,6 +58,7 @@ def today_usage() -> dict:
             "by_agent": {r[0]: {"tokens": r[1], "usd": _usd(r[1])} for r in rows},
         }
     except Exception as e:
+        logger.warning("skill_cost_monitor today_usage failed", exc_info=e)
         return {"status": "error", "reason": str(e)}
 
 
@@ -80,4 +83,5 @@ def monthly_usage() -> dict:
             "pct_used": round(usd / budget_m * 100, 1) if budget_m else 0,
         }
     except Exception as e:
+        logger.warning("skill_cost_monitor monthly_usage failed", exc_info=e)
         return {"status": "error", "reason": str(e)}

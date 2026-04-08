@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
-import random
 import sqlite3
 import time
-from pathlib import Path
 
 import httpx
+from backend.path_guard import enforce_write_path
+from configs.paths import DB_PATH
+
+logger = logging.getLogger("saturn.linkedin_search")
 try:
     from linkedin_api import Linkedin
-except Exception:
+except Exception as exc:
+    logger.warning("linkedin_api import failed: %s", exc)
     Linkedin = None
 
-DB_PATH = Path("/home/navin/Workspace/Saturn/database/saturn.db")
 ERROR_TYPES = {"API_ERROR", "AUTH_ERROR", "RATE_LIMIT", "NETWORK_ERROR", "DB_ERROR", "LOGIC_ERROR"}
 DAILY_LIMIT = 20
+LINKEDIN_THROTTLE_SECONDS = 1.0
 
 
 def utc_now() -> str:
@@ -24,7 +28,9 @@ def utc_now() -> str:
 
 
 def db_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    db_path = enforce_write_path(DB_PATH, "linkedin-search-db")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
@@ -39,7 +45,8 @@ def row_get(row: sqlite3.Row | tuple | None, key: str, index: int, default: int 
         if isinstance(row, sqlite3.Row):
             return int(row[key] or default)
         return int(row[index] or default)
-    except Exception:
+    except Exception as exc:
+        logger.warning("linkedin_search row_get failed", exc_info=exc)
         return default
 
 
@@ -81,6 +88,7 @@ def ensure_counter(conn: sqlite3.Connection) -> sqlite3.Row | tuple:
         SELECT id, COALESCE(call_count,0) AS call_count, COALESCE(paused,0) AS paused
         FROM api_usage_log
         WHERE service='linkedin' AND usage_date=? AND endpoint='daily_counter'
+        ORDER BY id DESC
         LIMIT 1
         """,
         (today,),
@@ -175,7 +183,8 @@ def _serpapi_search(query: str, conn: sqlite3.Connection) -> list[dict]:
 
     attempted_call = False
     try:
-        time.sleep(random.uniform(1, 3))
+        if LINKEDIN_THROTTLE_SECONDS > 0:
+            time.sleep(LINKEDIN_THROTTLE_SECONDS)
         attempted_call = True
         response = httpx.get("https://serpapi.com/search.json", params=params, timeout=10.0)
         response.raise_for_status()
@@ -225,7 +234,8 @@ def _linkedin_api_search(niche: str, city: str, conn: sqlite3.Connection) -> lis
 
     attempted_call = False
     try:
-        time.sleep(random.uniform(1, 3))
+        if LINKEDIN_THROTTLE_SECONDS > 0:
+            time.sleep(LINKEDIN_THROTTLE_SECONDS)
         attempted_call = True
         api = Linkedin(linkedin_email, linkedin_password)
         results = api.search_people(keywords=f"{niche} {city}".strip(), limit=10) or []
@@ -292,8 +302,8 @@ def search_prospects(
         try:
             log_error(conn, "linkedin_search", "DB_ERROR", "database write failure", str(exc))
             conn.commit()
-        except sqlite3.Error:
-            pass
+        except sqlite3.Error as log_exc:
+            logger.warning("linkedin_search DB error logging failed", exc_info=log_exc)
         return []
     finally:
         if own_conn:

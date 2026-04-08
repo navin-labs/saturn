@@ -3,20 +3,32 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import logging
 import os
 import re
 import sqlite3
 import subprocess
 import shutil
 import threading
-import uuid
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request
 from urllib.request import urlopen
 
 from flask import Flask, jsonify, request
-from flask_cors import CORS
+try:
+    from flask_cors import CORS
+except ModuleNotFoundError as exc:
+    logging.getLogger("saturn.api").warning(
+        "flask_cors unavailable; continuing without CORS middleware: %s",
+        exc,
+    )
+
+    def CORS(app, *args, **kwargs):  # type: ignore[override]
+        return app
+
+logger = logging.getLogger("saturn.api")
+RATE_LIMIT_USER_MESSAGE = "⚠️ Rate limit reached. System is safe. Retry in a few minutes."
 
 try:
     from modules.tool_registry import ToolExecutionError, ToolNotFoundError, ToolRegistry
@@ -55,7 +67,7 @@ AGENT_CONFIG = {
     "pulse": {"name": "Pulse", "role": "Planning & Operations"},
 }
 
-PIPELINE_STAGES = ["new", "contacted", "qualified", "proposal", "won", "lost"]
+PIPELINE_STAGES = ["new", "contacted", "qualified", "lost"]
 ERROR_TYPES = {
     "API_ERROR",
     "AUTH_ERROR",
@@ -66,10 +78,8 @@ ERROR_TYPES = {
 }
 STATUS_TRANSITIONS = {
     "new": {"contacted"},
-    "contacted": {"qualified"},
-    "qualified": {"proposal"},
-    "proposal": {"won", "lost"},
-    "won": set(),
+    "contacted": {"qualified", "lost"},
+    "qualified": set(),
     "lost": set(),
 }
 
@@ -86,6 +96,90 @@ def add_column_if_missing(conn: sqlite3.Connection, table: str, column_def: str)
 
 
 def ensure_operational_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("""CREATE TABLE IF NOT EXISTS leads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        company TEXT,
+        contact TEXT,
+        source TEXT,
+        status TEXT DEFAULT 'new',
+        value_estimate REAL DEFAULT 0,
+        notes TEXT,
+        last_contact TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        priority TEXT DEFAULT 'normal',
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS revenue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        client TEXT,
+        service TEXT,
+        amount REAL DEFAULT 0,
+        status TEXT DEFAULT 'pending',
+        invoice_date TIMESTAMP,
+        paid_date TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS content_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        lead_id INTEGER,
+        status TEXT DEFAULT 'pending',
+        processed_at TIMESTAMP,
+        processed_by TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS outreach_drafts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        lead_id INTEGER NOT NULL,
+        draft_text TEXT NOT NULL DEFAULT '',
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        processed_at TIMESTAMP
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS email_send_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        lead_id INTEGER,
+        draft_id INTEGER,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempt_count INTEGER DEFAULT 1,
+        error_category TEXT,
+        sent_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS agent_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent TEXT NOT NULL,
+        action TEXT NOT NULL,
+        detail TEXT,
+        result TEXT,
+        ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS token_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent TEXT,
+        action TEXT,
+        tokens INTEGER DEFAULT 0,
+        logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS system_alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        level TEXT DEFAULT 'info',
+        source TEXT,
+        message TEXT,
+        resolved INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        agent TEXT,
+        title TEXT,
+        error_type TEXT,
+        alert_type TEXT
+    )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS error_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         agent TEXT NOT NULL,
@@ -147,13 +241,47 @@ def ensure_operational_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "error_log", "context TEXT")
     add_column_if_missing(conn, "token_log", "agent TEXT")
     add_column_if_missing(conn, "token_log", "action TEXT")
+    conn.execute("UPDATE outreach_drafts SET status=lower(COALESCE(status,'')) WHERE status IS NOT NULL")
+    conn.execute("UPDATE email_send_log SET status=lower(COALESCE(status,'')) WHERE status IS NOT NULL")
+    conn.execute(
+        """
+        DELETE FROM outreach_drafts
+        WHERE lower(COALESCE(status,'')) IN ('pending','approved')
+          AND id NOT IN (
+              SELECT MAX(id)
+              FROM outreach_drafts
+              WHERE lower(COALESCE(status,'')) IN ('pending','approved')
+              GROUP BY lead_id
+          )
+        """
+    )
+    conn.execute(
+        """
+        DELETE FROM email_send_log
+        WHERE draft_id IS NOT NULL
+          AND id NOT IN (
+              SELECT MAX(id)
+              FROM email_send_log
+              WHERE draft_id IS NOT NULL
+              GROUP BY draft_id, status
+          )
+        """
+    )
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_leads_website_norm ON leads(website_norm) WHERE website_norm IS NOT NULL"
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_content_queue_lead ON content_queue(lead_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_content_queue_status ON content_queue(status)")
     conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_outreach_drafts_active_lead "
+        "ON outreach_drafts(lead_id) WHERE lower(COALESCE(status,'')) IN ('pending','approved')"
+    )
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_token_log_agent_action_day ON token_log(agent, action, logged_at)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_email_send_log_draft_status "
+        "ON email_send_log(draft_id, status) WHERE draft_id IS NOT NULL"
     )
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_api_usage_daily_counter "
@@ -197,6 +325,7 @@ def transition_allowed(current_status: str, next_status: str, manual_override: b
 
 def get_db_conn() -> sqlite3.Connection:
     global _SCHEMA_READY
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=30000")
@@ -241,8 +370,15 @@ def is_error_text(text: str | None) -> bool:
 def safe_float(value) -> float:
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
+        logger.warning("safe_float parse failed for value=%r", value, exc_info=exc)
         return 0.0
+
+
+def deterministic_run_id(agent: str, started_at: int, attempt: int = 0) -> str:
+    safe_agent = re.sub(r"[^a-z0-9_]+", "_", str(agent or "saturn").strip().lower()).strip("_") or "saturn"
+    base = f"run_{safe_agent}_{int(started_at)}"
+    return base if attempt <= 0 else f"{base}_{attempt + 1}"
 
 
 def compute_summary(conn: sqlite3.Connection) -> dict:
@@ -375,8 +511,8 @@ def _parse_agent_timestamp(value: str | None) -> dt.datetime | None:
     for candidate in (text.replace("Z", ""), text):
         try:
             return dt.datetime.fromisoformat(candidate)
-        except ValueError:
-            continue
+        except ValueError as exc:
+            logger.debug("agent timestamp parse failed for %r: %s", candidate, exc)
     return None
 
 
@@ -530,7 +666,8 @@ def check_n8n_status() -> str:
     try:
         with urlopen("http://127.0.0.1:5678/healthz", timeout=2):
             return "online"
-    except (URLError, TimeoutError):
+    except (URLError, TimeoutError) as exc:
+        logger.warning("n8n health probe failed", exc_info=exc)
         return "offline"
 
 
@@ -577,7 +714,8 @@ def check_openclaw_status() -> str:
         try:
             with urlopen(url, timeout=2):
                 return "online"
-        except Exception:
+        except Exception as exc:
+            logger.warning("openclaw health probe failed for %s", url, exc_info=exc)
             continue
     return "offline"
 
@@ -593,7 +731,8 @@ def count_active_saturn_timers() -> int:
         )
         lines = [line for line in result.stdout.splitlines() if "saturn-" in line and ".timer" in line]
         return len(lines)
-    except Exception:
+    except Exception as exc:
+        logger.warning("count_active_saturn_timers failed", exc_info=exc)
         return 0
 
 
@@ -668,7 +807,7 @@ def _execute_tool_with_run_log(tool: str, args: dict) -> tuple[dict, int]:
     try:
         for attempt in range(3):
             if not run_id:
-                run_id = f"run_{agent}_{started_at}_{uuid.uuid4().hex[:6]}"
+                run_id = deterministic_run_id(agent, started_at, attempt)
             try:
                 with get_db_conn() as conn:
                     conn.execute(
@@ -680,13 +819,22 @@ def _execute_tool_with_run_log(tool: str, args: dict) -> tuple[dict, int]:
                     )
                     conn.commit()
                 break
-            except sqlite3.IntegrityError:
+            except sqlite3.IntegrityError as exc:
+                logger.warning(
+                    "agent run log collision for tool=%s agent=%s run_id=%s attempt=%s",
+                    tool,
+                    agent,
+                    run_id,
+                    attempt + 1,
+                    exc_info=exc,
+                )
                 if attempt == 2:
                     run_id = ""
                 else:
                     run_id = ""
                     continue
-    except Exception:
+    except Exception as exc:
+        logger.warning("agent run log initialization failed for tool %s", tool, exc_info=exc)
         run_id = ""
 
     try:
@@ -701,31 +849,47 @@ def _execute_tool_with_run_log(tool: str, args: dict) -> tuple[dict, int]:
                 conn.commit()
         return result, 200
     except ToolNotFoundError as exc:
-        if run_id:
+        logger.warning("tool not found: %s", tool, exc_info=exc)
+        try:
             with get_db_conn() as conn:
-                conn.execute(
-                    "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
-                    (int(now_utc().timestamp()), exc.error_type, run_id),
-                )
+                if run_id:
+                    conn.execute(
+                        "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
+                        (int(now_utc().timestamp()), exc.error_type, run_id),
+                    )
+                log_error(conn, agent, tool, "LOGIC_ERROR", exc.message, json.dumps(payload, default=str)[:500])
                 conn.commit()
+        except sqlite3.Error as log_exc:
+            logger.warning("tool-not-found logging failed for %s", tool, exc_info=log_exc)
         return build_tool_error(tool, exc.error_type, exc.message), exc.status_code
     except ToolExecutionError as exc:
-        if run_id:
+        logger.warning("tool execution error for %s", tool, exc_info=exc)
+        try:
             with get_db_conn() as conn:
-                conn.execute(
-                    "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
-                    (int(now_utc().timestamp()), exc.error_type, run_id),
-                )
+                if run_id:
+                    conn.execute(
+                        "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
+                        (int(now_utc().timestamp()), exc.error_type, run_id),
+                    )
+                mapped_type = "LOGIC_ERROR" if exc.error_type == "invalid_args" else "API_ERROR"
+                log_error(conn, agent, tool, mapped_type, exc.message, json.dumps(payload, default=str)[:500])
                 conn.commit()
+        except sqlite3.Error as log_exc:
+            logger.warning("tool-execution logging failed for %s", tool, exc_info=log_exc)
         return build_tool_error(tool, exc.error_type, exc.message), exc.status_code
     except Exception as exc:
-        if run_id:
+        logger.warning("tool execution failed for %s", tool, exc_info=exc)
+        try:
             with get_db_conn() as conn:
-                conn.execute(
-                    "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
-                    (int(now_utc().timestamp()), "execution_error", run_id),
-                )
+                if run_id:
+                    conn.execute(
+                        "UPDATE agent_runs SET ended_at=?, status=? WHERE run_id=?",
+                        (int(now_utc().timestamp()), "execution_error", run_id),
+                    )
+                log_error(conn, agent, tool, "API_ERROR", str(exc)[:300], json.dumps(payload, default=str)[:500])
                 conn.commit()
+        except sqlite3.Error as log_exc:
+            logger.warning("unexpected tool failure logging failed for %s", tool, exc_info=log_exc)
         return build_tool_error(tool, "execution_error", str(exc)[:300]), 500
 
 
@@ -743,6 +907,8 @@ def _tool_result_message(payload: dict) -> str:
         result = payload.get("result")
 
     if isinstance(result, dict):
+        if str(result.get("status") or "").strip().lower() == "rate_limited":
+            return RATE_LIMIT_USER_MESSAGE
         for key in ("message", "result", "reason", "status"):
             value = result.get(key)
             if value:
@@ -900,7 +1066,7 @@ def saturn_update_lead_status(lead_id: int):
                 """,
                 (next_status, now, now, follow_due, now, int(has_override), lead_id),
             )
-        elif next_status in ("won", "lost"):
+        elif next_status == "lost":
             cur = conn.execute(
                 """
                 UPDATE leads
@@ -1088,6 +1254,8 @@ def saturn_approve_internal(draft_id: int, action: str, new_text: str = ""):
         msg = _tool_result_message(payload)
         lower_msg = msg.lower()
         status = "ok"
+        if "rate limit" in lower_msg:
+            status = "rate_limited"
         if "failed" in lower_msg or "not found" in lower_msg or "invalid" in lower_msg:
             status = "failed"
 
@@ -1097,8 +1265,8 @@ def saturn_approve_internal(draft_id: int, action: str, new_text: str = ""):
             with sqlite3.connect(str(DB_PATH), timeout=10) as conn:
                 log_error(conn, "echo", "approve_endpoint", "API_ERROR", "MCP approval command failed", str(e))
                 conn.commit()
-        except Exception:
-            pass
+        except Exception as log_exc:
+            logger.warning("approve_endpoint DB logging failed", exc_info=log_exc)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -1232,7 +1400,8 @@ def saturn_health_full():
         import psutil  # type: ignore
 
         ram_pct = float(psutil.virtual_memory().percent)
-    except Exception:
+    except Exception as exc:
+        logger.warning("psutil memory probe failed", exc_info=exc)
         ram_pct = 0.0
 
     _, _, free = shutil.disk_usage("/")
@@ -1369,7 +1538,8 @@ def saturn_system_health():
                 )
             )
             last_error = latest_error_message(conn)
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        logger.warning("system health DB probe failed", exc_info=exc)
         db_status = "offline"
         token_usage_today = 0
         restart_count = 0

@@ -5,9 +5,12 @@ import asyncio
 import importlib.util
 import inspect
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("saturn.tool_registry")
 
 
 class ToolRegistryError(RuntimeError):
@@ -24,7 +27,7 @@ class ToolNotFoundError(ToolRegistryError):
 
 
 class ToolExecutionError(ToolRegistryError):
-    pass
+    """Raised when a tool execution fails."""
 
 
 @dataclass(frozen=True)
@@ -109,8 +112,8 @@ def _normalize_result_payload(result: Any) -> tuple[Any, Any]:
             try:
                 parsed = json.loads(text)
                 return parsed, parsed
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("tool result JSON parse failed", exc_info=exc)
         wrapped = {"status": "ok", "result": result}
         return wrapped, wrapped
 
